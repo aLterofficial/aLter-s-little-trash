@@ -1,0 +1,53 @@
+# ── 运行时与数据（绝不入仓）──
+.venv/
+__pycache__/
+*.pyc
+data/*.json
+data/*.db
+data/*.jsonl
+data/*.txt
+data/*.png
+data/memory_*.md
+data/notes/
+data/msglog/
+data/stm/
+data/img_temp/
+data/agnes_output/
+data/inspection/
+data/stats*/
+data/faces/*.png
+data/faces/*.jpg
+data/faces/*.gif
+data/faces/*.webp
+
+# ── 配置（只保留 example.* 模板）──
+huanmeng/config/.env
+huanmeng/config/adapter_config.toml
+huanmeng/config/bot_config.toml
+huanmeng/config/roles.toml
+huanmeng/config/persona_data.json
+
+# ── 备份与日志 ──
+_backup-*/
+*.log
+*.bak
+*.last-*
+
+# ── 账号数据 ──
+QQProfile/
+QQProfile.bak-*/
+_downloads/
+qrcode.*
+api key.txt
+
+# ── NapCat 运行时 ──
+NapCat/config/
+NapCat/node_modules/
+NapCat/*.exe
+NapCat/*.dll
+NapCat/**/*.log
+
+# ── 系统 ──
+Thumbs.db
+desktop.ini
+.DS_Store
