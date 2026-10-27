@@ -6,30 +6,6 @@
 
 ---
 
-## 目录与关键文件
-
-| 路径 | 说明 |
-|---|---|
-| `D:\QQBot\NapCat\` | NapCat 程序本体 |
-| `D:\QQBot\NapCat\start-napcat.bat` | **启动 NapCat（含独立 profile 参数，勿删参数）** |
-| `D:\QQBot\NapCat\loadNapCat.template.js` | **引导脚本模板：注入 `-q <账号>` 实现免扫码自动登录** |
-| `D:\QQBot\NapCat\config\onebot11_<BOT_QQ>.json` | OneBot v11 服务端配置（WS 端口 8099） |
-| `D:\QQBot\NapCat\config\webui.json` | WebUI token（当前 `<NAPCAT_WEBUI_TOKEN>`） |
-| `D:\QQBot\QQProfile\` | **NapCat 专用的 QQ 用户数据目录** |
-| `D:\QQBot\huanmeng\` | 幻梦框架 |
-| `D:\QQBot\huanmeng\config\.env` | **API 密钥** |
-| `D:\QQBot\huanmeng\config\bot_config.toml` | 模型名 / QQ 号 / 人格 |
-| `D:\QQBot\huanmeng\config\adapter_config.toml` | WS 地址 / 群白名单 / 私聊白名单 |
-| `D:\QQBot\huanmeng\config\roles.toml` | admin |
-| `D:\QQBot\huanmeng\relay_test.py` | **接口自检脚本** |
-| `D:\QQBot\launcher.ps1` | **一键启动器（启动/停止/状态，带健康检查）** |
-| `D:\QQBot\bot.ico` | 启动器图标（由 `tools\make_icon.py` 生成） |
-| `D:\QQBot\tools\pget.ps1` | 并发分片下载器 |
-| `D:\QQBot\start-all.bat` | 简易启动 |
-| `D:\QQBot\stop-all.ps1` | 简易停止 |
-
----
-
 
 ### 命令行
 
@@ -54,12 +30,6 @@ cd D:\QQBot\huanmeng; .venv\Scripts\python.exe relay_test.py
 
 > ⚠️ **`launcher.ps1` 必须保存为 UTF-8 with BOM**。Windows PowerShell 5.1 读取无 BOM 的
 > `.ps1` 会按 ANSI 解码，脚本里的中文会导致解析失败。用编辑器改动后若出现乱码报错，
-> 用这条命令补 BOM：
-> ```powershell
-> $p='D:\QQBot\launcher.ps1'
-> $t=[IO.File]::ReadAllText($p,[Text.Encoding]::UTF8)
-> [IO.File]::WriteAllText($p,$t,(New-Object Text.UTF8Encoding($true)))
-> ```
 
 
 **注意**：改 `.env` 里的 Key 必须**重启进程**，`/~reload` 无效——因为 `load_dotenv`
