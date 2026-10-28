@@ -1,0 +1,142 @@
+# === 敏感配置 ===
+config/.env
+config/.env.bak*
+config/bot_config.toml
+config/adapter_config.toml
+config/roles.toml
+*.key
+*.pem
+
+# === 运行时数据 ===
+data/img_temp/
+data/fav.json
+data/luck.json
+data/search_cache.json
+data/context_cache.json
+data/Image_description_cache.txt
+data/economy.json
+data/search.db
+data/msglog/
+data/stats_*.json
+data/power/*.jsonl          # 功耗采样（运行时数据；config.json / calib.json 保留可版本化）
+data/stats_archive/
+data/Group_members_name.txt
+data/recall.json
+data/memory_*.md
+data/notes/
+data/templates/old/
+data/Message_frequency_cache.txt
+data/features.json
+# 棋局运行时数据（对局/房间号表，不入库）
+data/go_games.json
+data/wzq_games.json
+data/xq_games.json
+data/wzq_results.json
+data/game_rooms.json
+# Steam 运行时数据（绑定关系是 QQ↔SteamID，属隐私；价格账本同为运行时产物）
+data/steam_bind.json
+data/steam_price_history.json
+
+# === 日志 ===
+/logs/
+*.log
+
+# === 插件下载缓存 ===
+plugins/
+
+# === 自更新模块运行时快照缓存 ===
+.update_cache/
+
+# === 临时目录 ===
+tmp/
+temp/
+
+# === 阶段备份 ===
+backup/
+
+# === 数据库文件 ===
+*.db
+*.sqlite
+
+# === 私有实现备份（未引用，勿删） ===
+modules_private/
+
+# === 临时脚本/测试/调试图 ===
+_check_all.py
+_fix_admin.py
+_revert.py
+data/read_the_username.py
+test_cchess_render.py
+test_changelog.py
+data/eq_province_zoom.png
+data/eq_test_card.png
+data/eq_tianditu_card.png
+data/eq_zoom_fix.png
+
+# === Python ===
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.venv/
+
+# === IDE ===
+.idea/
+.vscode/
+*.swp
+*~
+.workbuddy/
+outputs/
+
+# === 系统 ===
+Thumbs.db
+.DS_Store
+.bot_protect
+docs/fix_change.md
+test_fc_sim.py
+
+# 误建于仓库内的备份目录
+qqbot-backup/
+
+# === 后台面板（panel/）===
+# ⚠️ 密钥文件绝对禁止提交
+panel/secret.toml
+panel/secret.toml.bak_*
+panel/audit.log
+# 前端构建产物与依赖
+panel_web/node_modules/
+panel_web/dist/
+panel_web/.vite/
+panel_web/src/api/generated/
+
+# ── 赞赏码 / 赞助名单（部署方私有，不进仓库）────────────────────
+# 理由：赞赏码是部署者个人的收款二维码，写死在仓库里别人 clone 后会出现
+# 部署者的收款码（违反"通用化：写死的别人部署会坏事"原则）。
+# 部署时手动放置：data/images/reward_qrcode.png；缺失时 /~赞赏 会提示管理员检查路径。
+data/images/reward_qrcode.png
+data/rewards.json
+data/memory_links.json
+data/context_cache.json
+# 部署/改造前的备份文件（本地留档用，不进仓库）
+*.bak_*
+
+# 面板已拆出为独立项目（huanmeng-panel），本地残留不跟踪
+panel/
+panel_web/
+
+# 反扒探测脚本与快照（临时工具，不入库）
+/_probe/
+data/steam_cache/
+
+# 排查/调试产物（下划线开头）
+data/_*
+
+# CF Worker 的临时密钥文件（绝不入库）
+deploy/cf-steam-proxy/_secrets.json
+deploy/cf-steam-proxy/.dev.vars
+
+deploy/cf-steam-proxy/tokens.local.md
+
+# wrangler 本地状态
+deploy/cf-steam-proxy/.wrangler/

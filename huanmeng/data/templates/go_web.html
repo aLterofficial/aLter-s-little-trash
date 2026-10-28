@@ -1,0 +1,451 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Ccircle cx='16' cy='16' r='15' fill='%231c2333'/%3E%3Ccircle cx='13' cy='12' r='4' fill='%235a626e'/%3E%3C/svg%3E">
+<title>围棋对局 · 幻梦</title>
+<link rel="stylesheet" href="${CSS_URL}">
+<style>
+.mine{font-family:var(--mono);font-size:9px;font-weight:700;color:#fff;background:var(--ink-2);
+  border-radius:999px;padding:2px 6px;margin-left:5px;vertical-align:1px}
+.rec.cool .mine{background:var(--cool)}
+.rec.warm .mine{background:var(--warm)}
+.chip.role{background:#fdf6e6;border-color:#f3e2bb;color:#96650f}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <div class="topbar">
+    <div class="brand"><span class="nm">幻梦</span><span class="sl">/</span><span class="tp">围棋</span></div>
+    <div class="tb-sep"></div>
+    <span class="chip" id="chip-room">房间 <b>--</b></span>
+    <span class="chip role" id="chip-role" style="display:none"></span>
+    <div class="chips">
+      <span class="chip" id="chip-size">棋盘 <b>--</b></span>
+      <span class="chip" id="chip-diff">难度 <b>--</b></span>
+      <span class="chip cool" id="chip-moves">手数 <b>0</b></span>
+      <span class="chip warm" id="chip-time">用时 <b>00:00</b></span>
+    </div>
+  </div>
+
+  <div class="layout">
+    <div class="col">
+      <section class="card">
+        <div class="card-head">
+          <span class="bar cool"></span><h2>棋 盘</h2>
+          <span class="note" id="board-note">载入中…</span>
+        </div>
+        <div class="board-body">
+          <div class="bwrap" id="bwrap">
+            <div class="corner"></div>
+            <div class="clabels" id="clabels"></div>
+            <div class="rlabels" id="rlabels"></div>
+            <div class="barea" id="barea">
+              <div class="board-bg"></div>
+              <svg id="grid" xmlns="http://www.w3.org/2000/svg"></svg>
+              <div class="hits" id="hits"></div>
+            </div>
+          </div>
+        </div>
+        <div class="statusline" id="status"><span class="dot"></span><span id="status-text">载入中…</span></div>
+        <div class="btns" id="btns">
+          <button class="btn cool" id="btn-pass">
+            <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M4 4.5 7.4 8 4 11.5"/><path d="M8.6 4.5 12 8l-3.4 3.5"/></svg>
+            停一手
+          </button>
+          <button class="btn warm" id="btn-resign">
+            <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round"><path d="M4.2 13.6V2.6"/><path d="M4.2 3.3h7.4l-1.7 2.4 1.7 2.4H4.2z"/></svg>
+            认输
+          </button>
+          <button class="btn" id="btn-refresh">
+            <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M13 8a5 5 0 1 1-1.6-3.7"/><path d="M13 2.6V5h-2.4"/></svg>
+            刷新
+          </button>
+        </div>
+        <div class="tip" id="tip">点击交叉点落子，你执黑先行。</div>
+      </section>
+    </div>
+
+    <div class="col">
+      <section class="card">
+        <div class="card-head"><span class="bar"></span><h2>双 方 战 绩</h2><span class="note" id="rec-note"></span></div>
+        <div class="vs-grid">
+          <div class="rec cool" id="rec-black">
+            <span class="rec-accent"></span>
+            <div class="rec-top">
+              <span class="stone-dot b"></span>
+              <span class="rec-name"><b id="nm-black">你</b><i>BLACK · 先行</i></span>
+              <span class="turnbadge" id="badge-black">等待</span>
+            </div>
+            <div class="rec-stats">
+              <div class="stat"><span class="k">盘上子</span><span class="v" id="sb">0</span></div>
+              <div class="stat"><span class="k">提子</span><span class="v" id="cb">0</span></div>
+              <div class="stat"><span class="k">落子</span><span class="v" id="mb">0</span></div>
+            </div>
+            <div class="rec-bar"><i id="bar-b" style="width:50%"></i></div>
+            <div class="rec-bar-k"><span id="k-b">盘面 50%</span><span>黑</span></div>
+          </div>
+
+          <div class="vspill">VS</div>
+
+          <div class="rec warm" id="rec-white">
+            <span class="rec-accent"></span>
+            <div class="rec-top">
+              <span class="stone-dot w"></span>
+              <span class="rec-name"><b id="nm-white">幻梦</b><i>WHITE · 后手</i></span>
+              <span class="turnbadge" id="badge-white">等待</span>
+            </div>
+            <div class="rec-stats">
+              <div class="stat"><span class="k">盘上子</span><span class="v" id="sw">0</span></div>
+              <div class="stat"><span class="k">提子</span><span class="v" id="cw">0</span></div>
+              <div class="stat"><span class="k">落子</span><span class="v" id="mw">0</span></div>
+            </div>
+            <div class="rec-bar"><i id="bar-w" style="width:50%"></i></div>
+            <div class="rec-bar-k"><span id="k-w">盘面 50%</span><span>白</span></div>
+          </div>
+        </div>
+      </section>
+
+      <section class="card">
+        <div class="card-head"><span class="bar warm"></span><h2>对 局 信 息</h2></div>
+        <div class="card-body">
+          <div class="kv">
+            <div class="item"><span class="k">AI 难度</span><span class="v" id="i-diff">--</span></div>
+            <div class="item"><span class="k">手数</span><span class="v" id="i-moves">0</span></div>
+            <div class="item"><span class="k">停一手</span><span class="v" id="i-pass">0</span></div>
+            <div class="item"><span class="k">用时</span><span class="v" id="i-time">00:00</span></div>
+          </div>
+          <div class="result-banner" id="result" style="display:none">
+            <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M3 8.4 6.2 11.6 13 4.8"/></svg>
+            <span id="result-text"></span>
+          </div>
+        </div>
+      </section>
+
+      <section class="card">
+        <div class="card-head"><span class="bar"></span><h2>棋 谱</h2><span class="note" id="log-note"></span></div>
+        <div class="card-body"><div class="moves" id="moves"><div class="skeleton" style="width:60%"></div></div></div>
+      </section>
+    </div>
+  </div>
+</div>
+
+<script>
+const ROOM = "${ROOM}", TOKEN = "${TOKEN}";
+const CELL_BASE = {9: 46, 13: 34, 19: 27};
+let busy = false, finished = false, curN = 0;
+let LETTERS = "", STAR = [], boardCache = null, lastCache = null, tipTimer = null;
+let me = "", myColor = 0, spectator = false;
+let myTurnNow = false;   // render 里更新；play() 靠它判断能否乐观落子
+let pendingMinMoves = 0, pendingUntil = 0, stateSeq = 0, appliedSeq = 0;
+let lastSig = "";       // 上次状态指纹；有值就带上去让服务端做长轮询（见 refresh）
+let curMoves = 0;        // 最近一次被接受的状态里的手数
+
+const $ = id => document.getElementById(id);
+
+function calcCell(n) {
+  const holder = $("barea").closest(".board-body");
+  const avail = holder.clientWidth - 32 - 26;
+  const base = CELL_BASE[n] || 27;
+  const fit = Math.floor(avail / n);
+  return Math.max(12, Math.min(base, fit > 0 ? fit : base));
+}
+
+function buildBoard(n, letters, stars) {
+  curN = n; LETTERS = letters; STAR = stars || [];
+  const cell = calcCell(n);
+  const side = n * cell, stone = Math.round(cell * 0.9);
+
+  const bw = $("bwrap");
+  bw.style.gridTemplateColumns = `26px ${side}px`;
+  bw.style.gridTemplateRows = `26px ${side}px`;
+
+  const cl = $("clabels"), rl = $("rlabels");
+  cl.style.gridTemplateColumns = `repeat(${n},${cell}px)`;
+  cl.innerHTML = letters.split("").map(c => `<div>${c}</div>`).join("");
+  rl.style.gridTemplateRows = `repeat(${n},${cell}px)`;
+  let rh = "";
+  for (let r = 0; r < n; r++) rh += `<div>${n - r}</div>`;
+  rl.innerHTML = rh;
+
+  const ba = $("barea");
+  ba.style.width = side + "px";
+  ba.style.height = side + "px";
+
+  const lo = cell / 2, hi = (n - 0.5) * cell;
+  let svg = "";
+  for (let i = 0; i < n; i++) {
+    const p = cell / 2 + i * cell;
+    svg += `<line x1="${lo}" y1="${p}" x2="${hi}" y2="${p}"/>`;
+    svg += `<line x1="${p}" y1="${lo}" x2="${p}" y2="${hi}"/>`;
+  }
+  const rDot = Math.max(1.5, +(cell * 0.055).toFixed(2));
+  STAR.forEach(k => {
+    const rc = k.split(",");
+    const r = +rc[0], c = +rc[1];
+    svg += `<circle cx="${cell / 2 + c * cell}" cy="${cell / 2 + r * cell}" r="${rDot}"/>`;
+  });
+  $("grid").innerHTML = svg;
+
+  let hits = "";
+  for (let r = 0; r < n; r++) {
+    for (let c = 0; c < n; c++) {
+      // ★ data-r 用 (n-1-r)：视觉最上面一行 = 下标 n-1 = 坐标行 n（v2.3.39 修，与 wzq 同因：原来下标 0 在最上面、行标签却写 n-r，二者矛盾）
+      hits += `<div class="hit" data-r="${n - 1 - r}" data-c="${c}" style="left:${c * cell}px;top:${r * cell}px;width:${cell}px;height:${cell}px"></div>`;
+    }
+  }
+  const h = $("hits");
+  h.innerHTML = hits;
+  h.dataset.stone = stone;
+  h.dataset.cell = cell;
+  h.querySelectorAll(".hit").forEach(el => { el.onclick = () => play(el); });
+  paint();
+}
+
+function paint() {
+  if (!curN || !boardCache) return;
+  const stone = +$("hits").dataset.stone, cell = +$("hits").dataset.cell;
+  const pad = Math.round((cell - stone) / 2);
+  const last = lastCache || [];
+  $("hits").querySelectorAll(".hit").forEach(el => {
+    const r = +el.dataset.r, c = +el.dataset.c, v = boardCache[r][c];
+    let inner = "";
+    if (v) {
+      const cls = v === 1 ? "b" : "w";
+      const lm = (last[0] === r && last[1] === c) ? " last" : "";
+      inner = `<div class="stone ${cls}${lm}" style="width:${stone}px;height:${stone}px"></div>`;
+    } else if (!finished && !spectator) {
+      inner = `<div class="ghost gb" style="width:${stone}px;height:${stone}px"></div>`;
+    }
+    if (el.innerHTML !== inner) el.innerHTML = inner;
+    el.style.padding = pad + "px";
+    el.classList.toggle("locked", !!v || finished);
+  });
+}
+
+async function play(el) {
+  if (busy || finished || spectator) return;
+  const r = +el.dataset.r, c = +el.dataset.c;
+  if (boardCache && boardCache[r][c]) return;
+  busy = true;
+  tip("落子中…");
+  // ★ 乐观渲染（v2.3.38）：见 wzq_web.html::play 的详细说明。
+  //   本页走 Cloudflare Tunnel（一次往返 1.3~1.6s），点完还要再取一次盘面，
+  //   等响应再画会有明显延迟感。先本地画，服务端返回后由 refresh() 覆盖。
+  const prevBoard = boardCache ? boardCache.map(row => row.slice()) : null;
+  const prevLast = lastCache;
+  const optimistic = !!myTurnNow && !!boardCache;
+  if (optimistic) {
+    boardCache[r][c] = myColor;
+    lastCache = [r, c];
+    paint();
+    // 乐观之后服务端至少该有 curMoves+1 手；在那之前到达的旧状态一律丢弃（防闪回）
+    pendingMinMoves = curMoves + 1;
+    pendingUntil = Date.now() + 6000;
+  }
+  function rollback() {
+    if (optimistic) {
+      boardCache = prevBoard; lastCache = prevLast; paint();
+      pendingMinMoves = 0;
+    }
+  }
+  try {
+    const res = await fetch(`${API_BASE}/api/r/${ROOM}/move?t=${TOKEN}`, {
+      method: "POST", headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({coord: `${r + 1},${c + 1}`})
+    }).then(x => x.json());
+    if (!res.ok) { rollback(); tip(res.msg || "这手不行"); await refresh(); return; }
+    tip(res.msg || "落子成功");
+    await refresh();
+  } catch (e) { rollback(); tip("网络错误，稍后重试"); }
+  finally { busy = false; }
+}
+
+async function act(path) {
+  if (busy) return;
+  busy = true;
+  try {
+    const res = await fetch(`${API_BASE}/api/r/${ROOM}/${path}?t=${TOKEN}`, {method: "POST"}).then(x => x.json());
+    tip(res.msg || "");
+    await refresh();
+  } catch (e) { tip("网络错误，稍后重试"); }
+  finally { busy = false; }
+}
+
+function tip(s) {
+  $("tip").textContent = s;
+  clearTimeout(tipTimer);
+  if (s) tipTimer = setTimeout(() => { $("tip").textContent = ""; }, 6000);
+}
+
+function fmtTime(sec) {
+  sec = Math.max(0, sec | 0);
+  const h = Math.floor(sec / 3600), m = Math.floor(sec % 3600 / 60), s = sec % 60;
+  const p = n => String(n).padStart(2, "0");
+  return h ? `${h}:${p(m)}:${p(s)}` : `${p(m)}:${p(s)}`;
+}
+
+function setStatus(cls, text) {
+  $("status").className = "statusline " + cls;
+  $("status-text").textContent = text;
+}
+
+function render(st) {
+  if (!st.ok) { tip("链接无效或已过期"); return; }
+  // ★ 丢弃「比乐观渲染更旧」的状态（v2.3.39）：乐观画子后，1 秒轮询里那些
+  //   在落子之前发出的请求会晚到，带回手数更少的旧盘面 → 把刚挪的子擦掉（闪回）。
+  if (pendingMinMoves && (st.move_count || 0) < pendingMinMoves
+      && Date.now() < pendingUntil) {
+    return;
+  }
+  pendingMinMoves = 0;
+  curMoves = st.move_count || 0;
+  finished = !!st.finished;
+  spectator = st.role === "spectator";
+  me = st.role || "";
+  myColor = me === "black" ? 1 : (me === "white" ? 2 : 0);
+  $("chip-room").innerHTML = `房间 <b>${ROOM}</b>`;
+  const rc = $("chip-role");
+  rc.style.display = "inline-block";
+  rc.textContent = spectator ? "观战模式" : (myColor ? `你执${myColor === 1 ? "黑" : "白"}` : "旁观");
+
+  if (!st.size) {
+    setStatus("done", "对局已结束（记录已归档）");
+    $("result").style.display = "flex";
+    $("result-text").textContent = "对局已归档，去群里用 /~go start 再开一局";
+    $("btn-pass").disabled = true;
+    $("btn-resign").disabled = true;
+    $("btns").style.display = "none";
+    return;
+  }
+
+  // 先落数据再建盘，避免重建瞬间用到旧盘面
+  boardCache = st.board; lastCache = st.last_move || [];
+  if (st.size !== curN || STAR.length !== st.stars.length) buildBoard(st.size, st.letters, st.stars);
+
+  if (st.black) $("nm-black").innerHTML = st.black.name + (myColor === 1 ? '<span class="mine">你</span>' : "");
+  if (st.white) $("nm-white").innerHTML = st.white.name + (myColor === 2 ? '<span class="mine">你</span>' : "");
+
+  $("chip-size").innerHTML = `棋盘 <b>${st.size} 路</b>`;
+  $("chip-diff").innerHTML = st.pvp ? "模式 <b>人人对战</b>" : `难度 <b>${st.difficulty}</b>`;
+  $("chip-moves").innerHTML = `手数 <b>${st.move_count}</b>`;
+  $("chip-time").innerHTML = `用时 <b>${fmtTime(st.elapsed)}</b>`;
+  $("board-note").textContent = `${st.size} × ${st.size}`;
+
+  const sB = st.stones.black, sW = st.stones.white, tot = Math.max(1, sB + sW);
+  $("sb").textContent = sB; $("sw").textContent = sW;
+  $("cb").textContent = st.captures.black; $("cw").textContent = st.captures.white;
+
+  const mv = st.moves || [];
+  let mB = mv.filter(m => m.color === "black" && !m.pass).length;
+  let mW = mv.filter(m => m.color === "white" && !m.pass).length;
+  if (st.move_count > mv.length && mB + mW === 0) {
+    const half = Math.round(st.move_count / 2);
+    if (st.player_color === 1) { mB = half; mW = st.move_count - half; }
+    else { mW = half; mB = st.move_count - half; }
+  }
+  $("mb").textContent = mB; $("mw").textContent = mW;
+
+  const pB = Math.round(sB / tot * 100);
+  $("bar-b").style.width = pB + "%";
+  $("bar-w").style.width = (100 - pB) + "%";
+  $("k-b").textContent = `盘面 ${pB}%`;
+  $("k-w").textContent = `盘面 ${100 - pB}%`;
+
+  const turnIsBlack = st.turn === 1;
+  const myTurn = !finished && !spectator && st.turn === myColor;
+  myTurnNow = myTurn;      // 供 play() 的乐观渲染判断（见该函数注释）
+  const bActive = !finished && turnIsBlack;
+  const wActive = !finished && !turnIsBlack;
+  $("badge-black").textContent = finished ? "已结束" : (bActive ? (spectator || myColor === 1 ? "行棋中" : "等待") : "等待");
+  $("badge-white").textContent = finished ? "已结束" : (wActive ? (spectator || myColor === 2 ? "行棋中" : "等待") : "等待");
+  $("badge-black").classList.toggle("on", bActive);
+  $("badge-white").classList.toggle("on", wActive);
+
+  $("i-diff").textContent = st.difficulty;
+  $("i-moves").textContent = st.move_count;
+  $("i-pass").textContent = st.passes;
+  $("i-time").textContent = fmtTime(st.elapsed);
+  $("rec-note").textContent = `共 ${st.move_count} 手`;
+
+  $("btns").style.display = spectator ? "none" : "flex";
+  if (finished) {
+    setStatus("done", st.result_text || "对局已结束");
+    $("result").style.display = "flex";
+    const fs = st.final_score;
+    $("result-text").textContent = fs ? `数子结果 黑 ${fs.black} : 白 ${fs.white}` : (st.result_text || "对局已结束");
+    $("btn-pass").disabled = true;
+    $("btn-resign").disabled = true;
+  } else if (spectator) {
+    setStatus("bot", `观战中 · ${st.black ? st.black.name : "黑"} vs ${st.white ? st.white.name : "白"}`);
+    $("result").style.display = "none";
+  } else {
+    const other = st.turn === 1 ? (st.black ? st.black.name : "对手") : (st.white ? st.white.name : "对手");
+    setStatus(myTurn ? "you" : "bot",
+              myTurn ? "轮到你了 · 点击交叉点落子" : `等待 ${other} 落子…`);
+    $("result").style.display = "none";
+    $("btn-pass").disabled = false;
+    $("btn-resign").disabled = false;
+  }
+
+  const list = mv.slice().reverse();
+  $("log-note").textContent = mv.length ? `最近 ${mv.length} 手` : "";
+  $("moves").innerHTML = list.length
+    ? list.map(m => m.pass
+        ? `<span class="mv pass"><i class="${m.color === "black" ? "b" : "w"}">${m.n}</i>停一手</span>`
+        : `<span class="mv ${m.color === "black" ? "b" : "w"}"><i>${m.n}</i>${m.label}</span>`).join("")
+    : `<div class="empty">还没有落子</div>`;
+
+  paint();
+}
+
+async function refresh() {
+  const my = ++stateSeq;          // ★ 乱序保护：只接受不比自己已渲染的更旧的响应
+  try {
+    // ★ 长轮询（v2.3.39）：带上上次的状态指纹，服务端会把请求**压住**直到状态变化，
+    //   再立刻返回。普通轮询下"对手落子 → 这里看到"要 ~1.9s（隧道往返 1.3s + 空转），
+    //   长轮询可压到接近一个单程。
+    //   服务端若还没升级（响应里没有 sig），lastSig 会一直是空串 → 自动退回普通轮询。
+    let url = `${API_BASE}/api/r/${ROOM}/state?t=${TOKEN}`;
+    // ⚠️ wait 是**秒数**不是布尔（服务端 min(wait,25)）——
+    //   第一版传 wait=1（当布尔用），等于只压 1 秒就返回，白折腾。
+    if (lastSig) url += `&wait=25&sig=${encodeURIComponent(lastSig)}`;
+    const st = await fetch(url).then(x => x.json());
+    if (my < appliedSeq) return;  // 已有更新的响应渲染过 → 丢弃这条旧响应
+    appliedSeq = my;
+    if (typeof st.sig === "string" && st.sig) lastSig = st.sig;
+    render(st);
+  } catch (e) { /* 静默，下轮再试 */ }
+}
+
+buildBoard(19, "ABCDEFGHJKLMNOPQRST", []);
+$("btn-pass").onclick = () => act("pass");
+$("btn-resign").onclick = () => { if (confirm("确定认输吗？")) act("resign"); };
+$("btn-refresh").onclick = () => { tip("已刷新"); refresh(); };
+let rt = null;
+window.addEventListener("resize", () => {
+  clearTimeout(rt);
+  rt = setTimeout(() => { if (curN) buildBoard(curN, LETTERS, STAR); }, 140);
+});
+document.addEventListener("visibilitychange", () => { if (!document.hidden) refresh(); });
+refresh();
+// ★ 接续轮询（v2.3.39）：上一次响应回来就立刻发下一次，而不是固定等 1 秒。
+//   本页走 CF Tunnel，单请求往返 1.3~1.6s；固定 1s 间隔会让「空转 1s」叠加在
+//   往返之上 —— 观战端实测「对手落子 → 自己看到」要 ~1.9s，改成接续后 ≈ 一次往返。
+//   观战者没有本地动作可乐观渲染，这条对观战体验最关键。
+//   250ms 下限：本地/内网低延迟时避免把请求打爆。
+//   因为是 await 串行发出，同一时刻只有一个在途请求，天然不会乱序。
+async function pollLoop() {
+  for (;;) {
+    if (!document.hidden) await refresh();
+    // 长轮询生效时请求本身就被服务端压着，间隔可以很短；
+    // 退回普通轮询时给足间隔，避免低延迟环境下打爆请求。
+    await new Promise(r => setTimeout(r, lastSig ? 100 : 700));
+  }
+}
+pollLoop();
+</script>
+</body>
+</html>

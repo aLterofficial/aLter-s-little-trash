@@ -1,0 +1,4444 @@
+"""
+指令系统（重构版）
+- 所有指令处理函数集中管理
+- 统一签名: async def cmd_xxx(args, user_id, group_id, sender_name, is_group, bot_qq) -> str | None
+- 全量 i18n + 详细日志
+- 指令注册表 COMMAND_MAP
+- 分发器 handle_command
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import os
+import random
+import re
+import string
+import time
+import urllib.parse
+from datetime import date
+from pathlib import Path
+
+import httpx
+
+from core.logger import get_logger
+from core.config import get_config, reload_config, load_roles_config, save_roles_config
+from utils.format_lang import format_lang
+from modules.fav import get_all_fav, FAV_FILE as FAV_FILE_REF, reset_all_fav
+from services.sender import send_group_msg, send_private_msg, send_raw_group, send_raw_user
+from modules.search import perform_search
+from modules.pgr import cmd_pgr
+from modules.earthquake import cmd_eq
+from modules.nasa import cmd_nasa
+from modules.agnes import cmd_draw, cmd_video, cmd_img2video, owner_quota_get, owner_quota_set, owner_quota_reset
+from modules.voice import cmd_voice
+try:
+    from modules.steam import cmd_steam, cmd_steam_doing
+except ImportError:          # 缺依赖时不拖垮整条指令链路
+    cmd_steam = cmd_steam_doing = None
+try:
+    from modules.ping import cmd_ping
+except ImportError:
+    async def cmd_ping(args, user_id, group_id, sender_name, is_group, bot_qq):
+        return "ping 模块未安装喵~"
+try:
+    from modules.op import cmd_op, cmd_persona, cmd_master, cmd_sleep, cmd_hanxu
+except ImportError:
+    cmd_op = cmd_persona = cmd_master = cmd_sleep = cmd_hanxu = None
+try:
+    from modules.weather import query_weather, build_weather_report
+except ImportError:
+    query_weather = build_weather_report = None
+
+from modules.changelog import send_changelog_card, send_weather_card, send_box_card
+from modules.whois_lookup import lookup_domain   # ★ WHOIS 域名查询
+
+try:
+    from modules.tuf_commands import cmd_tuflevel, cmd_tuf_search, cmd_tufd, cmd_tufpage
+except ImportError:
+    cmd_tuflevel = cmd_tuf_search = cmd_tufd = cmd_tufpage = None
+
+from core.token_tracker import cmd_cost, cmd_tokens, cmd_cache
+from core.bot_notes import cmd_note
+from modules.screen import cmd_screen
+from core.ctx_usage import cmd_ctx
+from modules.msg_relay import cmd_say
+from modules.reward import cmd_reward   # ★ 赞赏码 / 赞助名单
+from modules.power import cmd_power      # ★ 服务器功耗 / 电费（仅管理员）
+from modules.memory_link import cmd_mlink   # ★ 跨聊天记忆关联（单一入口）
+
+# ★ 经济系统已迁移为插件（points/shop，v2.0.1），不再内置
+
+logger = get_logger("commands")
+
+
+async def _cmd_gh(args, user_id, group_id, sender_name, is_group, bot_qq):
+    try:
+        from modules.gh import cmd_gh
+    except ImportError:
+        return "公会登记模块未安装喵~"
+    return await cmd_gh(args, user_id, group_id, sender_name, is_group, bot_qq)
+
+
+async def _cmd_update(args, user_id, group_id, sender_name, is_group, bot_qq):
+    from modules.auto_update import cmd_update
+    return await cmd_update(args, user_id, group_id, sender_name, is_group, bot_qq)
+
+
+# ════════════════════════════════════════════════════════════
+#  指令处理函数
+# ════════════════════════════════════════════════════════════
+
+async def cmd_help(args, user_id, group_id, sender_name, is_group, bot_qq):
+    """显示帮助列表 — /~help 发送完整指令卡片，/~help <指令> 查看详细用法"""
+    cfg = get_config()
+    name = cfg.bot_name
+    logger.info("指令 /~help 触发 user=%d args=%s", user_id, args)
+
+    # ── 详细帮助：/~help <关键词> ──
+    if args:
+        keyword = args[0].lower().lstrip("/~")
+        # format_lang 无 default 参数，缺失会返回 [LANG:...] 裸键 → 先用 has_key 判断
+        from utils.format_lang import has_key
+        if has_key(f"help.detail.{keyword}"):
+            return format_lang(f"help.detail.{keyword}")
+        # 兜底：docstring / _CMD_DESC / capability 描述（覆盖所有 COMMAND_MAP + 插件指令）
+        try:
+            from modules.commands import COMMAND_MAP
+            target_handler = COMMAND_MAP.get(keyword)
+            desc = ""
+            if target_handler is not None:
+                doc = (getattr(target_handler, '__doc__', '') or '').strip()
+                if doc:
+                    desc = doc.split('\n')[0]
+            if not desc:
+                from services.llm import _CMD_DESC
+                desc = _CMD_DESC.get(keyword, "")
+                if not desc and target_handler is not None:
+                    for k, h in COMMAND_MAP.items():
+                        if h is target_handler:
+                            desc = _CMD_DESC.get(k, "")
+                            if desc:
+                                break
+            # 插件指令描述（help_card._PLUGIN_COMMANDS）
+            if not desc:
+                try:
+                    from modules.help_card import _PLUGIN_COMMANDS
+                    desc = _PLUGIN_COMMANDS.get(keyword, "")
+                except Exception:
+                    pass
+            if desc:
+                return f"【指令 /~{keyword}】\n{desc}"
+            # 插件指令描述
+            try:
+                from core.capability import get_capability_registry
+                reg = get_capability_registry()
+                for c in (list(reg._caps.values()) if hasattr(reg, "_caps") else []):
+                    if getattr(c, "name", "") == keyword and getattr(c, "description", ""):
+                        return f"【指令 /~{keyword}】\n{c.description}"
+            except Exception:
+                pass
+        except Exception:
+            pass
+        return format_lang("help.not_found", keyword=keyword)
+
+    # ── 完整帮助：发送预渲染指令卡片 ──
+    card_path = Path(__file__).resolve().parent.parent / "data" / "help_card.png"
+    if card_path.exists():
+        try:
+            from services.sender import send_by_chat_type
+            cq = f"[CQ:image,file=file:///{card_path.as_posix()}]"
+            chat_id = group_id if is_group else user_id
+            await send_by_chat_type(cq, chat_id, is_group, user_id if not is_group else None)
+            return None  # 已发送
+        except Exception as e:
+            logger.warning("帮助卡片发送失败，降级: %s", e)
+    else:
+        logger.warning("帮助卡片文件不存在，降级文本")
+
+    # ── 降级：文本帮助 ──
+    is_admin = cfg.is_admin(user_id, group_id)
+    lines = [format_lang("help.header", name=name), ""]
+    lines.append(format_lang("help.usage_hint"))
+    lines.append(format_lang("help.usage_example"))
+    lines.append("")
+
+    from utils.format_lang import get_lang_data
+    sections = get_lang_data().get("help", {}).get("sections", [])
+    if isinstance(sections, str):
+        sections = [
+            ["--- 聊天 ---", "@${name} <内容>     跟我说话", "{{提示词}}         注入临时人设（仅主人）"],
+            ["--- 工具 ---", "/~s <关键词>        联网搜索", "/~remind <时间> <事> 定时提醒", "/~抽 <A> <B>        随机选择"],
+            ["--- 数据 ---", "/~stats [...]      群聊统计", "/~recall [数量]     撤回记录", "/~favlist           好感度"],
+            ["--- 系统 ---", "/~cost              Token消耗统计", "/~info             运行状态", "/~up [版本]         更新日志", "/~ping             在线检测"],
+            ["--- 主人专用 ---", "/~owner ...        配置管理", "/~preset ...        提示词注入", "/~reload           热重载"],
+        ]
+    for section in sections:
+        if not section:
+            continue
+        label = section[0]
+        if "主人" in label and not is_admin:
+            continue
+        lines.append(label)
+        for cmd in section[1:]:
+            lines.append(f"   {cmd}")
+        lines.append("")
+
+    lines.append(format_lang("help.footer"))
+    return "\n".join(lines)
+
+
+# ════════════════════════════════════════════════════════════
+#  详细帮助数据
+# ════════════════════════════════════════════════════════════
+
+_HELP_DETAIL = {
+    "nasa": "【NASA 每日天文图 /~nasa】\n"
+          "  nasa [日期]  查看 NASA 每日天文图片，如 /~nasa 2025-06-01\n",
+    "pgr": "【Phigros 查询 /~pgr】\n"
+          "  pgr login / me / top / song / new\n",
+    "wzq": "【五子棋 /~wzq】\n"
+           "  duel @某人    发起挑战\n"
+            "  accept        接受挑战\n"
+           "  decline       拒绝挑战\n"
+           "  cancel        取消未开始的挑战\n"
+           "  <坐标>        落子 (H8 / 8,8)\n"
+           "  ai <难度> [nofb] 人机对战 (可选无禁手)\n"
+           "  board         查看棋盘\n"
+           "  surrender     认输\n"
+           "  undo          悔棋 (对手再发一次确认)\n"
+           "  status        对局信息\n"
+           "  history [N]   历史战绩\n"
+           "  history <编号> board 查看对局棋盘",
+
+    "remind": "【提醒 /~remind /~提醒】\n"
+              "  /~remind 30分钟后 吃饭\n"
+              "  /~remind 2小时后 开会\n"
+              "  /~remind 明天14:30 午休\n"
+              "  /~remind 14:30 下班\n"
+              "  到期自动 @ 提醒",
+
+    "chou": "【抽签 /~抽】\n"
+            "  /~抽 吃面 吃饭 打游戏   空格分隔\n"
+            "  /~抽 选项A,选项B,选项C   逗号分隔\n"
+            "  随机选一个 + 猫娘点评",
+
+    "stats": "【统计 /~stats /~统计】\n"
+             "  /~stats         今日群聊统计\n"
+             "  /~stats 昨天    昨日群聊回顾\n"
+             "  自动 0 点发送日报",
+
+    "recall": "【撤回 /~recall】\n"
+              "  /~recall        查看最近 5 条撤回\n"
+              "  /~recall 10     查看最近 10 条\n"
+              "  主动录制，100% 命中",
+
+    "s": "【搜索 /~s】\n"
+         "  /~s Python asyncio 用法\n"
+         "  自动判断是否需要搜索 + DuckDuckGo",
+
+    "favlist": "【好感度 /~favlist】\n"
+               "  查看当前群/私聊的好感度排行\n"
+               "  从高到低，显示昵称",
+
+    "luck": "【运气 /~luck】\n"
+            "  获取今日运气值 (1~100)\n"
+            "  0.1% 概率抽到 1000\n"
+            "  同一个人当天内结果不变",
+
+    "up": "【更新日志 /~up /~updateinfo】\n"
+          "  /~up            最新版本\n"
+          "  /~up 0.9.4      指定版本\n"
+          "  /~up all        完整日志\n"
+          "  生成精美 HTML 卡片",
+
+    "updateinfo": "【更新日志 /~up /~updateinfo】\n"
+                  "  /~up            最新版本\n"
+                  "  /~up 0.9.4      指定版本\n"
+                  "  /~up all        完整日志",
+
+    "info": "【系统信息 /~info】\n"
+            "  显示运行状态: 系统/运行时间/内存/磁盘/CPU\n"
+            "  连接状态/消息统计/模型列表/配置摘要",
+
+    "ping": "【在线 /~ping】\n"
+            "  测试 bot 是否在线\n"
+            "  随机猫娘卖萌回复，@ 触发者",
+
+    "owner": "【配置管理 /~owner (主人)】\n"
+             "  list <bot|adapter|roles>   列所有配置\n"
+             "  get <路径>      读取: get bot.reply_threshold\n"
+             "  set <路径> <值>  修改: set bot.reply_threshold 5\n"
+             "  data get <名> [键] 读数据\n"
+             "  data set <名> <键> <值> 改数据\n"
+             "  data reset <名|all> 清空\n"
+             "  wl show/add/remove  白名单快捷操作\n"
+             "  luck list/set/del   运气管理",
+
+    "preset": "【提示词注入 /~preset (主人)】\n"
+              "  /~preset        查看当前注入\n"
+              "  /~preset clear  清除注入\n"
+              "  或在消息中用 {{提示词}} 注入, {{reset}} 清除",
+
+    "reload": "【重载 /~reload (主人)】\n"
+              "  热重载所有配置，不重启进程\n"
+              "  也可用 systemctl reload robot",
+
+    "tr": "【翻译 /~tr /~翻译】\n"
+          "  /~tr en 你好           中→英\n"
+          "  /~tr 中文 hello        英→中\n"
+          "  /~tr jp こんにちは     →日文\n"
+          "  支持 en/zh/jp/kr/fr/de\n"
+          "  也支持 中文/英文/日文/韩文/法文/德文",
+
+    "translate": "【翻译 /~tr /~翻译】\n"
+                 "  /~tr en 你好\n"
+                 "  /~tr 中文 hello\n"
+                 "  支持 6 种语言",
+
+    "countdown": "【倒计时 /~countdown /~倒计时】\n"
+                 "  /~countdown 2026-12-25 圣诞节   添加\n"
+                 "  /~countdown                    查看\n"
+                 "  /~countdown list               详细列表\n"
+                 "  /~countdown del 1              删除",
+
+    "balance": "【余额查询 /~balance】\n"
+               "  查询 DeepSeek API 余额\n",
+
+    "plugin": "【插件管理 /~plugin (主人)】\n"
+              "  /~plugin             插件列表/状态\n"
+              "  /~plugin install <名|url>  安装插件（支持插件库名或 .hmp 直链）\n"
+              "  /~plugin unload <名>  卸载插件\n"
+              "  /~plugin reload <名>  热重载插件\n"
+              "  /~plugin pack <名>    把插件打包成 .hmp 分享\n"
+              "  /~plugin update [名]  从插件库一键更新",
+    "apy": "【审批 /~apy (主人)】\n"
+           "  /~apy <token> 同意|拒绝  响应插件发起的人工审批",
+
+    "voice": "【语音 /~voice】\n"
+             "  /~voice <文本>           Edge TTS 合成语音\n"
+             "  /~voice list             列出可用语音\n"
+             "  /~voice zh-CN-YunxiNeural <文本>  指定发音人\n"
+             "  默认: 晓晓 (女声)",
+
+    "cost": "【Token消耗 /~cost】\n"
+            "  查看今日/累计 token 消耗和费用\n",
+
+    "tokens": "【Token计算 /~tokens】\n"
+              "  /~tokens <文本>  计算 token 数和预估费用\n",
+
+    "note": "【你的笔记本 /~note】维护长期群内记忆（群内关系/称呼/约定/梗/谁是谁）。用法: /~note 查看 | /~note <内容> 新增 | /~note fix <序号> <新内容> 修改 | /~note del <序号> 删除 | /~note clear 清空。**重要：①有人说\"记一下/记住\"或出现值得长期记住的信息（谁是谁、什么关系、称呼黑话、约定）→ 必须用 calls 调 note 真的记，严禁只在回复说\"记下了\"；②发现之前记错了或信息过时了 → 用 calls 调 note 传 \"fix <序号> <新内容>\" 改正（序号见上下文里笔记本的编号），不要重新记一条重复的。**",
+
+    "cache": "【缓存命中率 /~cache】\n"             "  /~cache [天数]  查看 token 缓存命中率趋势（默认近7天）\n"
+             "  用于排查命中率低的原因（DeepSeek 前缀缓存）\n",
+
+    "resetfav": "【重置好感 /~resetfav (主人)】\n"
+                "  清空所有好感度数据",
+
+    "memory": "【记忆 /~memory】\n"
+              "  working      瞬时记忆（当前对话）\n"
+              "  short        短时记忆（最近30条）\n"
+              "  long         长时记忆（持久化）\n"
+              "  search <关键词> 搜索全部记忆\n"
+              "  clear        清空短时记忆",
+}
+
+
+async def cmd_favlist(args, user_id, group_id, sender_name, is_group, bot_qq):
+    """查看当前聊天的好感度列表"""
+    logger.info("指令 /~favlist 触发 user=%d chat=%d", user_id, group_id if is_group else user_id)
+    cfg = get_config()
+    chat_id = group_id if is_group else user_id
+
+    fav_data = get_all_fav(chat_id=chat_id, is_group=is_group)
+    if not fav_data:
+        return format_lang("favlist.empty")
+
+    lines = [format_lang("favlist.header")]
+    for key, val in sorted(fav_data.items(), key=lambda x: x[1], reverse=True):
+        # 从 key 中提取 user_id: "g123:456" -> "456", "p:456" -> "456"
+        uid = key.split(":")[-1] if ":" in key else key
+        name = cfg.get_display_name(uid, group_id=group_id if is_group else 0)
+        lines.append(format_lang("favlist.item_format", name=name, value=val))
+    return "\n".join(lines)
+
+
+async def cmd_info(args, user_id, group_id, sender_name, is_group, bot_qq):
+    """返回系统和运行状态"""
+    import platform
+    import time as _time
+    
+    cfg = get_config()
+    name = cfg.bot_name
+    logger.info("指令 /~info 触发 user=%d", user_id)
+
+    lines: list[str] = []
+    lines.append(f"--- {name} 运行状态 ---")
+    lines.append("")
+
+    # ── 系统 ──
+    lines.append("[System]")
+    lines.append(f"  OS     : {platform.system()} {platform.release()} ({platform.machine()})")
+    lines.append(f"  Python : {platform.python_version()}")
+    try:
+        import psutil
+        mem = psutil.virtual_memory()
+        total_mb = mem.total // (1024**2)
+        used_mb = mem.used // (1024**2)
+        lines.append(f"  Memory : {used_mb}MB / {total_mb}MB ({mem.percent}%)")
+        cpu_name = platform.processor() or "Unknown"
+        cpu_count = psutil.cpu_count(logical=True)
+        cpu_percent = psutil.cpu_percent(interval=0.3)
+        lines.append(f"  CPU    : {cpu_name} ({cpu_count}c) [{cpu_percent}%]")
+        disk = psutil.disk_usage('/')
+        disk_gb = disk.used / (1024**3)
+        disk_total = disk.total / (1024**3)
+        lines.append(f"  Disk   : {disk_gb:.1f}GB / {disk_total:.1f}GB ({disk.percent}%)")
+    except ImportError:
+        lines.append(f"  Memory : unavailable (install psutil)")
+        lines.append(f"  Disk   : unavailable")
+
+    lines.append("")
+
+    # ── 运行 ──
+    lines.append("[Runtime]")
+    try:
+        import psutil
+        proc = psutil.Process()
+        create_time = proc.create_time()
+        uptime_sec = int(_time.time() - create_time)
+        hours = uptime_sec // 3600
+        mins = (uptime_sec % 3600) // 60
+        lines.append(f"  Uptime : {hours}h {mins}m")
+    except Exception:
+        lines.append(f"  Uptime : unknown")
+
+    from core.dispatcher import get_current_dispatcher
+    from core.context_manager import get_context_mgr
+    disp = get_current_dispatcher()
+    ctx = get_context_mgr()
+    stats = ctx.get_stats()
+    lines.append(f"  Msgs   : {disp.msg_count if disp else '?'} processed")
+    lines.append(f"  Chats  : {stats.get('active_chats', 0)} active")
+    lines.append(f"  Tasks  : {stats.get('active_tasks', 0)} pending")
+
+    from modules.judge import get_cache_stats
+    cache_s = get_cache_stats()
+    lines.append(f"  S-Cache: {cache_s.get('entries', 0)} entries")
+
+    lines.append("")
+
+    # ── 连接 ──
+    lines.append("[Connection]")
+    from services.sender import get_ws_manager
+    ws = get_ws_manager()
+    lines.append(f"  WS     : {'connected' if ws.is_connected else 'disconnected'}")
+    lines.append(f"  Reconn : {ws._connect_count} times")
+
+    lines.append("")
+
+    # ── 配置 ──
+    lines.append("[Config]")
+    lines.append(f"  Reply Threshold : {cfg.reply_interest}")
+    lines.append(f"  Context Length  : {cfg.context_length}")
+    lines.append(f"  Private Chat    : {'ON' if cfg.enable_private else 'OFF'}")
+    lines.append(f"  Image Recog     : {'ON' if cfg.image_model.switch else 'OFF'}")
+    lines.append(f"  Groups          : {len(cfg.group_list)} whitelisted")
+    lines.append(f"  Debug           : {'ON' if cfg.debug_mode else 'OFF'}")
+
+    lines.append("")
+
+    # ── 模型 ──（从运行时配置读取，不写死）
+    lines.append("[Models]")
+    lines.append(f"  Reply  : {cfg.reply_model.name} @ {cfg.reply_model.provider}")
+    lines.append(f"  Cheap  : {cfg.cheap_model.name} @ {cfg.cheap_model.provider}")
+    lines.append(f"  Judge  : {cfg.judge_model.name} @ {cfg.judge_model.provider}")
+    img_enabled = "ON" if cfg.image_model.switch else "DISABLED"
+    lines.append(f"  Vision : {cfg.image_model.name} @ {cfg.image_model.provider} ({img_enabled})")
+
+    lines.append("")
+
+    # ── Token 消耗 ──
+    lines.append("[Token]")
+    try:
+        from core.token_tracker import calc_cost
+        cost = calc_cost(today_only=False)
+        t = cost["today"]
+        total = cost["total"]
+        lines.append(f"  Today  : {t['calls']} calls, {t['prompt']+t['completion']:,} tokens = ¥{t['cost']:.4f}")
+        lines.append(f"  Total  : {total['calls']} calls, {total['prompt']+total['completion']:,} tokens = ¥{total['cost']:.2f}")
+    except Exception:
+        lines.append("  (unavailable)")
+
+    return "\n".join(lines)
+
+
+async def cmd_balance(args, user_id, group_id, sender_name, is_group, bot_qq):
+    """余额查询 /~balance"""
+    from core.config import get_config
+    cfg = get_config()
+    key = cfg.reply_model.key
+    if not key:
+        return "未配置 DeepSeek API Key 喵~"
+
+    try:
+        import httpx
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            resp = await client.get(
+                "https://api.deepseek.com/user/balance",
+                headers={"Accept": "application/json", "Authorization": f"Bearer {key}"},
+            )
+            if resp.status_code != 200:
+                return f"查询失败: HTTP {resp.status_code} 喵~"
+            data = resp.json()
+    except Exception as e:
+        return f"查询余额失败: {e}"
+
+    if not data.get("is_available"):
+        return "余额查询不可用喵~"
+
+    infos = data.get("balance_infos", [])
+    if not infos:
+        return "余额信息为空喵~"
+
+    lines = ["【DeepSeek 余额】"]
+    for info in infos:
+        currency = info.get("currency", "?")
+        total = info.get("total_balance", "?")
+        granted = info.get("granted_balance", "?")
+        topped_up = info.get("topped_up_balance", "?")
+        lines.append(f"  总余额: {total} {currency}")
+        lines.append(f"  赠送额: {granted} {currency}")
+        lines.append(f"  充值额: {topped_up} {currency}")
+    return "\n".join(lines)
+
+
+async def cmd_box(args, user_id, group_id, sender_name, is_group, bot_qq):
+    """查询快递物流信息（优先输出精美卡片图片）"""
+    if not args:
+        return format_lang("box.prompt_input")
+    
+    tracking_no = args[0]
+    ckey = os.getenv("KUAIBAO_CKEY", "")
+    logger.info("指令 /~box 触发 单号=%s user=%d (卡片模式优先)", tracking_no, user_id)
+    
+    if not ckey:
+        logger.warning("快递API密钥未配置 (KUAIBAO_CKEY)")
+        return format_lang("error.api_fail")
+
+    api_url = f"https://openapi.dwo.cc/api/kuaiok?ckey={ckey}&trackingNo={tracking_no}"
+    
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.get(api_url)
+            if resp.status_code != 200:
+                return format_lang("box.api_error")
+            data = resp.json()
+    except Exception as e:
+        logger.warning("快递查询网络错误: %s", e)
+        return format_lang("box.network_error", error=str(e))
+
+    code = data.get("code", "")
+    if code != "0000000000":
+        logger.debug("快递API业务码异常: %s desc=%s", code, data.get("desc", ""))
+        return format_lang("box.api_error", message=data.get("desc", "未知错误"))
+
+    try:
+        pkgs = data.get("data", {}).get("packageInfoList", [])
+        if not pkgs:
+            return format_lang("box.no_result")
+        
+        pkg = pkgs[0]
+        cp_name = pkg.get("cpName", "某快递")
+        state = pkg.get("state", "未知")
+        
+        # 状态映射（i18n）
+        state_map = {
+            "TRANSPORT": format_lang("box.state_transport", default="运输中"),
+            "DELIVERING": format_lang("box.state_delivering", default="派送中"),
+            "SIGNED": format_lang("box.state_signed", default="已签收"),
+            "RETURN": format_lang("box.state_return", default="退件"),
+            "PENDING": format_lang("box.state_pending", default="待揽收"),
+            "FINISH": format_lang("box.state_finish", default="已完成"),
+        }
+        state_text = state_map.get(state, state)
+
+        latest_msg = pkg.get("operateMessage", "")
+        details = pkg.get("trackingDetails", [])
+
+        logger.info("快递查询成功: 单号=%s 状态=%s (%d条轨迹)", tracking_no, state_text, len(details))
+
+        # ── 异步卡片生成（不阻塞聊天线程）──
+        async def _bg_send_box():
+            try:
+                card_result = await send_box_card(
+                    cp_name=cp_name,
+                    tracking_no=tracking_no,
+                    state=state,
+                    state_text=state_text,
+                    latest_msg=latest_msg,
+                    details=details,
+                    group_id=group_id if is_group else None,
+                    user_id=user_id if not is_group else None,
+                    is_group=is_group,
+                )
+                if card_result is not None:
+                    # 卡片生成失败，回退纯文本
+                    fallback_lines = [
+                        format_lang("box.header", cp_name=cp_name, tracking_no=tracking_no),
+                        format_lang("box.state", state=state_text),
+                    ]
+                    if latest_msg:
+                        clean_msg = re.sub(r'[（(【][^）)]*(如遇问题|物流问题)[^）)]*[）)]️]?', '', latest_msg).strip()
+                        fallback_lines.append(format_lang("box.latest", msg=clean_msg))
+
+                    fallback_lines.append(format_lang("box.trajectory_header"))
+                    for d in details:
+                        t = d.get("time", "")
+                        ctx = d.get("context", "")
+                        ctx = re.sub(r'[（(【][^）)]*(如遇问题|物流问题)[^）)]*[）)]️]?', '', ctx).strip()
+                        time_str = f"{t[4:6]}-{t[6:8]} {t[8:10]}:{t[10:12]}" if len(t) >= 12 else t
+                        fallback_lines.append(format_lang("box.trajectory_item", time=time_str, context=ctx))
+
+                    if state == "DELIVERING":
+                        fallback_lines.append(format_lang("box.delivering_tip"))
+                    elif state == "SIGNED":
+                        fallback_lines.append(format_lang("box.signed_tip"))
+
+                    fallback_text = "\n".join(fallback_lines)
+                    if is_group:
+                        await send_group_msg(fallback_text, group_id)
+                    else:
+                        await send_private_msg(fallback_text, user_id)
+            except Exception as e:
+                logger.error("[BG] 快递卡片后台发送失败: %s", e, exc_info=True)
+
+        asyncio.create_task(_bg_send_box())
+        return None  # 后台异步处理，无需立即回复
+
+    except Exception as e:
+        logger.error("快递信息解析失败: %s", e)
+        return format_lang("box.parse_error")
+
+
+LUCK_FILE = Path(__file__).resolve().parent.parent / "data" / "luck.json"
+
+
+def _get_today_luck(user_id: int) -> int | None:
+    """获取今天该用户的幸运值，未抽签返回 None"""
+    today = date.today().isoformat()
+    if not LUCK_FILE.exists():
+        return None
+    try:
+        with open(LUCK_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data.get(today, {}).get(str(user_id))
+    except Exception as e:
+        logger.warning("获取今日运气失败: %s", e)
+        return None
+
+
+def _set_today_luck(user_id: int, value: int):
+    """保存今天该用户的幸运值"""
+    LUCK_FILE.parent.mkdir(parents=True, exist_ok=True)
+    today = date.today().isoformat()
+    
+    data = {}
+    if LUCK_FILE.exists():
+        try:
+            with open(LUCK_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except Exception:
+            data = {}
+    
+    if today not in data:
+        data[today] = {}
+    data[today][str(user_id)] = value
+    
+    # 只保留最近 7 天的数据
+    sorted_days = sorted(data.keys(), reverse=True)[:7]
+    data = {d: data[d] for d in sorted_days}
+    
+    with open(LUCK_FILE, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+
+
+async def cmd_luck(args, user_id, group_id, sender_name, is_group, bot_qq):
+    """每日运势抽签 /~luck — 今天内同一人返回相同值"""
+    logger.info("指令 /~luck 触发 user=%d", user_id)
+    
+    # 检查今天是否已经抽过
+    cached = _get_today_luck(user_id)
+    if cached is not None:
+        return f"[CQ:at,qq={user_id}] 你今天的运气是 {cached} 喵（今日已抽签）"
+    
+    # 首次抽签，生成幸运值
+    if random.random() < 0.001:
+        num = 1000
+    else:
+        num = random.randint(1, 100)
+    
+    _set_today_luck(user_id, num)
+    return f"[CQ:at,qq={user_id}] 你今天的运气是 {num} 喵"
+
+
+async def cmd_testsys(args, user_id, group_id, sender_name, is_group, bot_qq):
+    """发送测试卡片消息"""
+    logger.info("指令 /~testsys 触发 user=%d group=%d", user_id, group_id or 0)
+    
+    markdown_content = format_lang("testsys.card_markdown")
+    button = {
+        "id": "btn_test",
+        "render_data": {
+            "label": format_lang("testsys.button_label"),
+            "visited_label": format_lang("testsys.button_visited"),
+            "style": 1,
+        },
+        "action": {
+            "type": 2,
+            "permission": {"type": 2},
+            "data": "/~testok",
+            "enter": True,
+            "unsupport_tips": format_lang("testsys.unsupport_tip", default="当前版本不支持此按钮"),
+        },
+    }
+    keyboard = {"rows": [{"buttons": [button]}]}
+    card = {"type": "markdown", "data": {"markdown": {"content": markdown_content}, "keyboard": keyboard}}
+    
+    # 返回特殊标记，由分发器负责实际发送
+    return "__SYS_TEST_CARD__"
+
+
+async def cmd_testok(args, user_id, group_id, sender_name, is_group, bot_qq):
+    """测试卡片回调"""
+    logger.info("指令 /~testok 触发（卡片按钮点击）user=%d", user_id)
+    return "test ok"
+
+
+async def cmd_jsonraw(args, user_id, group_id, sender_name, is_group, bot_qq):
+    """/~jsonraw <对话内容> → 输出 LLM 原始 JSON"""
+    text = " ".join(args) if args else "喵"
+    logger.info("指令 /~jsonraw 触发 user=%d text='%s'", user_id, text[:40])
+    from services.llm import call_llm
+    from core.config import get_config
+    cfg = get_config()
+    max_chars = "40" if is_group else "12"
+    # ★ v2.2.2: 提醒模板统一放 data/skills/40_reminders.md（原硬编码已迁走）
+    from services.llm import _build_reminder
+    fmt_reminder = _build_reminder("jsonraw_reminder", max_chars=max_chars)
+
+    system = cfg.system_prompt or "你是幻梦，一只可爱的猫娘机器人。"
+    raw = await call_llm(cfg.reply_model, [
+        {"role": "system", "content": system},
+        {"role": "user", "content": f"{fmt_reminder}\n\n{sender_name}说：{text}"},
+    ], max_tokens=3000, temperature=0.8, json_mode=True)
+    return raw or "LLM 返回为空"
+
+
+async def cmd_md(args, user_id, group_id, sender_name, is_group, bot_qq):
+    """发送 Markdown 消息卡片 /~md <内容>"""
+    if not args:
+        return "用法: /~md <markdown内容>\\n示例: /~md # 标题\\n> 引用\\n**粗体** *斜体*"
+    raw = " ".join(args)
+    raw = raw.replace("\\n", "\n")
+
+    from services.sender import get_ws_manager
+    mgr = get_ws_manager()
+    payload = {
+        "action": "send_group_msg" if is_group else "send_private_msg",
+        "params": {
+            "message": [
+                {
+                    "type": "markdown",
+                    "data": {"content": raw},
+                }
+            ],
+        },
+    }
+    if is_group:
+        payload["params"]["group_id"] = group_id
+    else:
+        payload["params"]["user_id"] = user_id
+
+    await mgr.send(payload)
+    return None
+
+
+async def cmd_update_info(args, user_id, group_id, sender_name, is_group, bot_qq):
+    """显示更新日志 /~up [版本号]，无参数默认最新版本"""
+    logger.info("指令 /~up 触发 user=%d group=%d args=%s", user_id, group_id or 0, args)
+
+    from modules.changelog import _read_update_log
+    full_md = _read_update_log()
+
+    custom_md = None
+    if args and args[0].lower() != "all":
+        # 指定版本
+        target_version = args[0]
+        import re
+        clean = target_version.lstrip('vV')
+        pattern = rf'(##\s*v?{re.escape(clean)}[\s\S]*?)(?=\n## |$)'
+        match = re.search(pattern, full_md, re.IGNORECASE)
+        if match:
+            custom_md = match.group(1).strip()
+        else:
+            return f"❌ 未找到版本 {target_version} 的更新日志，请检查版本号是否正确。"
+    elif not args:
+        # 无参数：提取最新（第一个 ## v 段落）
+        import re
+        match = re.search(r'(##\s*v[\d.]+.*?)(?=\n## |$)', full_md, re.DOTALL)
+        if match:
+            custom_md = match.group(1).strip()
+
+    # 异步生成并发送卡片
+    async def _bg_send_changelog():
+        try:
+            result = await send_changelog_card(
+                group_id=group_id if is_group else None,
+                user_id=user_id if not is_group else None,
+                is_group=is_group,
+                custom_md=custom_md,
+            )
+            if result is not None:
+                if is_group:
+                    await send_group_msg(result, group_id)
+                else:
+                    await send_private_msg(result, user_id)
+        except Exception as e:
+            logger.error("[BG] 更新日志卡片后台发送失败: %s", e, exc_info=True)
+
+    asyncio.create_task(_bg_send_changelog())
+    return None
+
+
+# ─── 搜索指令 ──────────────────────────────────────────────
+
+async def cmd_search(args, user_id, group_id, sender_name, is_group, bot_qq):
+    """搜索指令 /~search [条数] [数据源] <关键词>，数据源: baidu/baike/bing/all(默认)"""
+    if not args:
+        return format_lang("search.prompt_input")
+
+    limit = 4
+    source = "all"
+
+    # 解析可选条数
+    if args[0].isdigit():
+        limit = min(int(args[0]), 20)
+        args = args[1:]
+        if not args:
+            return format_lang("search.prompt_input")
+
+    # 解析可选数据源
+    if args and args[0].lower() in ("baidu", "baike", "bing", "all"):
+        source = args[0].lower()
+        args = args[1:]
+        if not args:
+            return format_lang("search.prompt_input")
+
+    query = " ".join(args)
+    chat_id = group_id if is_group else user_id
+    logger.info("指令 /~search 触发 query='%s' limit=%d source=%s user=%d", query[:30], limit, source, user_id)
+
+    result = await perform_search(query, sender_name=sender_name, user_id=user_id,
+                                   chat_id=chat_id, limit=limit, source=source, is_group=is_group)
+    return result or format_lang("search.no_result")
+
+
+async def cmd_read(args, user_id, group_id, sender_name, is_group, bot_qq):
+    """/~read <URL> — 深度读取网页正文，返回纯文本摘要。用于搜索后精读具体链接"""
+    if not args:
+        return "用法: /~read <网页URL>  例如 /~read https://blog.csdn.net/xxx"
+    url = args[0]
+    if not url.startswith("http"):
+        return "请输入完整的网页URL（http/https开头）"
+
+    try:
+        from modules.local_search import get_scraper
+        scraper = get_scraper()
+        loop = asyncio.get_running_loop()
+        result = await loop.run_in_executor(None, lambda: scraper.scrape(url))
+        if result:
+            return result
+        return f"无法读取该页面: {url}"
+    except Exception as e:
+        logger.warning("页面读取失败: %s", e)
+        return f"读取页面失败: {e}"
+
+
+# ─── WHOIS 指令 ──────────────────────────────────────────────
+
+async def cmd_whois(args, user_id, group_id, sender_name, is_group, bot_qq):
+    """/~whois <域名> — 查询域名注册信息（注册商/注册时间/到期时间/NS/状态）"""
+    if not args:
+        return "用法: /~whois <域名>  例如 /~whois example.com"
+    domain = " ".join(args)
+    logger.info("指令 /~whois 触发 domain=%s user=%d", domain, user_id)
+    loop = asyncio.get_running_loop()
+    result = await loop.run_in_executor(None, lookup_domain, domain)
+    return result
+
+
+async def cmd_write_code(args, user_id, group_id, sender_name, is_group, bot_qq):
+    """/~write_code <描述> — 生成代码文件并发送"""
+    if not args:
+        return "用法: /~write_code <描述>  例如 /~write_code 用HTML写一个2048游戏"
+    desc = " ".join(args)
+    lang = "html" if any(kw in desc.lower() for kw in ("html", "网页", "web", "css", "javascript", "js")) else "python"
+    from core.tools import _write_code
+    return await _write_code(
+        language=lang, description=desc,
+        user_id=user_id, group_id=group_id, sender_name=sender_name,
+        is_group=is_group, bot_qq=bot_qq,
+    )
+
+
+# ─── 忽略/解除忽略指令 ──────────────────────────────────────
+
+async def cmd_ignore(args, user_id, group_id, sender_name, is_group, bot_qq):
+    """/~ignore <QQ> — 全群忽略该用户（仅 admin）"""
+    cfg = get_config()
+    if user_id != cfg.admin_qq:
+        return "只有管理员能操作喵~"
+    if not args:
+        return "用法: /~ignore <QQ号>  例如 /~ignore 123456789"
+    try:
+        target = int(args[0])
+    except ValueError:
+        return "QQ 号不对喵~"
+    from modules.ignore_users import add_ignored
+    add_ignored(target)
+    return f"已忽略 {target}，所有群都不会再收到他的消息"
+
+
+async def cmd_unignore(args, user_id, group_id, sender_name, is_group, bot_qq):
+    """/~unignore <QQ> — 解除全群忽略（仅 admin）"""
+    cfg = get_config()
+    if user_id != cfg.admin_qq:
+        return "只有管理员能操作喵~"
+    if not args:
+        return "用法: /~unignore <QQ号> / all  例如 /~unignore 123456789"
+    arg = args[0].lower()
+    from modules.ignore_users import remove_ignored, list_ignored
+    if arg == "all":
+        ids = list_ignored()
+        count = 0
+        for uid in ids:
+            remove_ignored(uid)
+            count += 1
+        return f"已解除所有忽略（共 {count} 人）"
+    try:
+        target = int(args[0])
+    except ValueError:
+        return "QQ 号不对喵~"
+    if remove_ignored(target):
+        return f"已解除忽略 {target}"
+    return f"{target} 不在忽略列表中喵~"
+
+
+# ─── 天气指令 ──────────────────────────────────────────────
+
+async def cmd_weather(args, user_id, group_id, sender_name, is_group, bot_qq):
+    """天气查询指令 /~天气 /~weather（优先输出精美卡片图片）"""
+    if not args:
+        return format_lang("weather.prompt_input")
+    
+    city = " ".join(args)
+    logger.info("指令 /~weather 触发 city=%s user=%d (卡片模式优先)", city, user_id)
+    
+    # 先发提示
+    from services.sender import send_group_msg, send_private_msg
+    tip = format_lang("weather.searching")
+    await (send_group_msg(tip, group_id) if is_group 
+           else send_private_msg(tip, user_id))
+    
+    data = await query_weather(city)
+    if data is None:
+        return format_lang("weather.fallback_error")
+
+    # ── 异步卡片生成（不阻塞聊天线程）──
+    async def _bg_send_weather():
+        try:
+            card_result = await send_weather_card(
+                data=data,
+                group_id=group_id if is_group else None,
+                user_id=user_id if not is_group else None,
+                is_group=is_group,
+            )
+            if card_result is not None:
+                # 卡片生成失败，回退纯文本
+                fallback = build_weather_report(data, user_id)
+                if is_group:
+                    await send_group_msg(fallback, group_id)
+                else:
+                    await send_private_msg(fallback, user_id)
+        except Exception as e:
+            logger.error("[BG] 天气卡片后台发送失败: %s", e, exc_info=True)
+
+    asyncio.create_task(_bg_send_weather())
+    return None  # 后台异步处理，无需立即回复
+
+
+# ─── 管理员指令 ────────────────────────────────────────────
+
+async def cmd_reload(args, user_id, group_id, sender_name, is_group, bot_qq):
+    """热重载配置（不重启进程）"""
+    roles = load_roles_config()
+    if user_id != roles.get("admin_qq"):
+        logger.warning("非管理员尝试 reload user=%d", user_id)
+        return format_lang("reload.permission_denied")
+
+    logger.info("管理员 %s(%d) 触发热重载", sender_name, user_id)
+    from modules.judge import reload_keywords
+    reload_config()
+    reload_keywords()
+    logger.info("热重载完成")
+    return format_lang("reload.success")
+
+
+async def cmd_add_relation(args, user_id, group_id, sender_name, is_group, bot_qq):
+    """添加用户关系（仅管理员私聊）"""
+    if is_group:
+        return format_lang("error.permission_denied")
+    
+    roles = load_roles_config()
+    admin_qq = roles["admin_qq"]
+    if user_id != admin_qq:
+        return format_lang("error.permission_denied")
+    
+    if len(args) < 3:
+        return format_lang("relation.prompt_usage")
+    
+    qq_id = args[0]
+    nick = args[1]
+    relation = args[2].lower()
+    
+    if not qq_id.isdigit():
+        return format_lang("relation.invalid_qq")
+    if relation == "admin":
+        return format_lang("relation.invalid_role")
+    
+    if "qq_name_map" not in roles:
+        roles["qq_name_map"] = {}
+    roles["qq_name_map"][qq_id] = nick
+    
+    if relation == "friend":
+        if "friend_qqs" not in roles:
+            roles["friend_qqs"] = []
+        if int(qq_id) not in roles["friend_qqs"]:
+            roles["friend_qqs"].append(int(qq_id))
+    
+    try:
+        save_roles_config(roles)
+        # ★ 立即刷新内存配置，否则 favlist/游戏等模块拿不到新名字
+        try:
+            from core.config import reload_config
+            reload_config()
+        except Exception:
+            pass
+        logger.info("关系更新: %s(%s) → %s 操作者=%s", qq_id, nick, relation, sender_name)
+        return format_lang("relation.success", qq=qq_id, name=nick, role=relation)
+    except Exception as e:
+        logger.error("保存关系配置失败: %s", e)
+        return format_lang("relation.save_fail", error=e)
+
+
+async def cmd_reset_fav(args, user_id, group_id, sender_name, is_group, bot_qq):
+    """重置好感度数据（仅管理员）"""
+    logger.info("指令 /~resetfav 触发 user=%d", user_id)
+    
+    # 权限检查
+    roles = load_roles_config()
+    if user_id != roles.get("admin_qq"):
+        return format_lang("reload.permission_denied")
+    
+    import modules.fav as fav_module
+    fav_file = str(fav_module.FAV_FILE)
+    if not os.path.exists(fav_file):
+        return format_lang("resetfav.empty")
+    
+    success = reset_all_fav()
+    if success:
+        logger.info("管理员 %s(%d) 重置了全部好感度", sender_name, user_id)
+        return format_lang("resetfav.success")
+    else:
+        return format_lang("error.command_error")
+
+
+# ─── 图片指令 ──────────────────────────────────────────────
+
+# Lolicon API（Pixiv 来源，免费无需 key）
+# 坑1: API 端点带 Referer 直接 403，必须拆两套头
+# 坑2: size 默认只返回 original，要 regular 必须手工拼接重复键 size=regular&size=original
+# 坑3: API 的 r18 字段是"库分类"，r18=0 仍可能返回带 R-18 标签的图 → 需黑名单二次过滤
+_LOLICON_API = "https://api.lolicon.app/setu/v2"
+_LOLICON_API_HEADERS = {"User-Agent": "Mozilla/5.0", "Accept": "application/json"}
+_LOLICON_IMG_HEADERS = {"Referer": "https://www.pixiv.net/", "User-Agent": "Mozilla/5.0"}
+
+_IMG_TEMP_DIR = Path(__file__).resolve().parent.parent / "data" / "img_temp"
+
+# 最近发送过的 pid 缓存：Lolicon 带 tag 查询返回顺序固定，同 tag 会命中同一批结果，
+# 用「多拉几张 + 随机选 + 跳过最近已发」保证重复 tag 也能拿到不同图
+_IMG_SENT_PIDS: set[int] = set()
+_IMG_SENT_PIDS_MAX = 200
+
+# r18=0（全年龄）时的标签黑名单，与 lolicon_client.py 一致（大小写不敏感）
+_R18_TAG_BLACKLIST = [
+    "r-18", "r18", "r-18g", "r18g", "裸体", "裸身", "全裸", "半裸",
+    "裸", "sex", "sexual", "hentai", "ero", "erotic", "porn", "nsfw",
+    "bukkake", "paizuri", "anal", "bondage", "tentacle", "ahegao",
+    "incest", "shotacon", "lolicon", "futanari", "furry", "beastiality",
+    "guro", "ryona", "scat", "vore", "exhibitionism", "masturbation",
+    "rape", "torture", "urine", "urethra", "prolapse", "fisting",
+    "diaper", "omorashi", "peeing", "pissing", "enema", "necrophilia",
+]
+
+
+def _is_r18_tag(tag: str) -> bool:
+    """判断单个标签是否命中 R18 黑名单（子串匹配，大小写不敏感）"""
+    tl = tag.lower()
+    return any(b in tl for b in _R18_TAG_BLACKLIST)
+
+
+def _build_lolicon_url(r18: int, tags: list[str], num: int = 1) -> str:
+    """构造 Lolicon 请求 URL。
+
+    size/tag 均为数组参数，GET 需用重复键手工拼接（urlencode 对数组不可靠）。
+    tag 数组之间是 AND 规则（最多 3 个）；单个 tag 内可用 | 分隔做 OR（最多 20 个），
+    例：tag=萝莉|少女&tag=白丝|黑丝  →  (萝莉 OR 少女) AND (白丝 OR 黑丝)
+    """
+    qs = ["r18=%d" % r18, "num=%d" % num, "size=regular", "size=original"]
+    for t in tags:
+        if t:
+            qs.append("tag=" + urllib.parse.quote(t))
+    return _LOLICON_API + "?" + "&".join(qs)
+
+
+async def _lolicon_fetch_and_send(
+    r18: int,
+    tags: list[str],
+    group_id: int | None,
+    user_id: int | None,
+    is_group: bool,
+    cmd_tag: str,
+):
+    """
+    Lolicon API 拉图 → 下载到本地临时目录 → 通过 CQ 码发送。
+
+    与天气/快递/更新日志卡片相同的发送方式：先下载到本地再用 `file:///` 路径，
+    NapCat 会读取本地文件并上传到 QQ 服务器。下载失败则降级直发远程 URL。
+    """
+    _IMG_TEMP_DIR.mkdir(parents=True, exist_ok=True)
+    image_url = ""  # 外层作用域保存，供 except 块 fallback 使用
+
+    try:
+        # Step 1: 请求 API（不带 Referer，否则 403）
+        # 统一拉 5 张：一是黑名单过滤后有剩余，二是随机选图避免同 tag 永远同一张
+        api_url = _build_lolicon_url(r18, tags, num=5)
+        logger.info("[%s] 请求 Lolicon API: %s", cmd_tag, api_url)
+        async with httpx.AsyncClient(timeout=15.0, follow_redirects=True,
+                                     headers=_LOLICON_API_HEADERS) as client:
+            resp = await client.get(api_url)
+            resp.raise_for_status()
+            items = (resp.json() or {}).get("data", [])
+        if r18 == 0:
+            # 双保险：库分类 r18 字段 + 标签黑名单（API r18 字段不等同作品本身标识）
+            items = [it for it in items
+                     if not it.get("r18") and not any(_is_r18_tag(t) for t in it.get("tags", []))]
+
+        # 跳过最近已发过的 pid（去重），全被跳过则放宽不跳过
+        fresh = [it for it in items if it.get("pid") not in _IMG_SENT_PIDS]
+        if not fresh:
+            fresh = items
+
+        if not fresh:
+            logger.warning("[%s] Lolicon 无结果 tags=%r", cmd_tag, tags)
+            tip = f"没有找到 tag「{' '.join(tags)}」的图，换个关键词试试喵~" if tags else "没有找到图片，稍后再试喵~"
+            if is_group and group_id:
+                await send_group_msg(tip, group_id)
+            elif not is_group and user_id:
+                await send_private_msg(tip, user_id)
+            return
+
+        item = random.choice(fresh)  # 随机选一张，避免同 tag 固定第一张
+        urls = item.get("urls", {})
+        image_url = urls.get("regular") or urls.get("original") or ""
+        if not image_url:
+            logger.error("[%s] Lolicon 返回无 urls 字段: %s", cmd_tag, item)
+            return
+
+        # 记录已发 pid（下载前记录：即使下载失败也不再反复选中这张）
+        _IMG_SENT_PIDS.add(item.get("pid"))
+        if len(_IMG_SENT_PIDS) > _IMG_SENT_PIDS_MAX:
+            _IMG_SENT_PIDS.clear()  # 超上限直接清空，简单可靠
+
+        logger.info("[%s] 获取到图片: %s... (pid=%s)", cmd_tag, image_url[:80], item.get("pid"))
+
+        # Step 2: 下载图片（必须带 Referer: https://www.pixiv.net/，走 i.pixiv.re 反代）
+        async with httpx.AsyncClient(timeout=30.0, follow_redirects=True,
+                                     headers=_LOLICON_IMG_HEADERS) as client:
+            img_resp = await client.get(image_url)
+            img_resp.raise_for_status()
+            img_bytes = img_resp.content
+
+        # 从 URL 或 Content-Type 推断扩展名
+        ext = ".jpg"
+        content_type = img_resp.headers.get("content-type", "")
+        if "png" in content_type:
+            ext = ".png"
+        elif "gif" in content_type:
+            ext = ".gif"
+        elif "webp" in content_type:
+            ext = ".webp"
+        else:
+            url_path = image_url.split("?")[0]
+            if url_path.endswith(".png"):
+                ext = ".png"
+            elif url_path.endswith(".gif"):
+                ext = ".gif"
+            elif url_path.endswith(".webp"):
+                ext = ".webp"
+
+        import uuid
+        local_filename = f"img_{cmd_tag}_{uuid.uuid4().hex[:8]}{ext}"
+        local_path = _IMG_TEMP_DIR / local_filename
+        local_path.write_bytes(img_bytes)
+        logger.info("[%s] 图片已保存: %s (%d bytes)", cmd_tag, local_path.name, len(img_bytes))
+
+        # Step 3: 构造 CQ 码并发送
+        normalized = str(local_path).replace("\\", "/")
+        cq_msg = f"[CQ:image,file=file:///{normalized}]"
+
+        if is_group and group_id:
+            await send_group_msg(cq_msg, group_id)
+        elif not is_group and user_id:
+            await send_private_msg(cq_msg, user_id)
+
+        logger.info("[%s] 图片已发送", cmd_tag)
+
+    except httpx.HTTPStatusError as e:
+        logger.warning("[%s] Lolicon 请求失败 (HTTP %d): %s", cmd_tag, e.response.status_code, e)
+        if image_url:
+            await _send_image_url_fallback(image_url, group_id, user_id, is_group, cmd_tag)
+    except Exception as e:
+        logger.error("[%s] Lolicon 图片处理异常: %s", cmd_tag, e, exc_info=True)
+        if image_url:
+            await _send_image_url_fallback(image_url, group_id, user_id, is_group, cmd_tag)
+
+
+async def _send_image_url_fallback(
+    image_url: str,
+    group_id: int | None,
+    user_id: int | None,
+    is_group: bool,
+    tag: str = "img",
+):
+    """备用方案：直接用远程 URL 构造 CQ 码发送（部分 NapCat 版本支持远程 URL）"""
+    try:
+        logger.info("[%s] 尝试备用方案: 直接发送远程 URL", tag)
+        cq_msg = f"[CQ:image,file={image_url}]"
+        if is_group and group_id:
+            await send_group_msg(cq_msg, group_id)
+        elif not is_group and user_id:
+            await send_private_msg(cq_msg, user_id)
+        logger.info("[%s] 备用方案已发送", tag)
+    except Exception as e2:
+        logger.error("[%s] 备用方案也失败了: %s", tag, e2)
+        # 最终兜底：纯文本提示
+        fallback = format_lang("image.service_error")
+        if is_group and group_id:
+            await send_group_msg(fallback, group_id)
+        elif not is_group and user_id:
+            await send_private_msg(fallback, user_id)
+
+
+async def cmd_img(args, user_id, group_id, sender_name, is_group, bot_qq):
+    """随机二次元图片 /~img [标签...]，多标签为 AND 匹配，如 /~img 甘雨 原神"""
+    tags = [a.strip() for a in args if a.strip()]
+    logger.info("指令 /~img 触发 user=%d group=%d tags=%r", user_id, group_id or 0, tags)
+
+    if tags and tags[0].lower() in ("help", "帮助", "?", "usage"):
+        return (
+            "【/~img 二次元图片】\n"
+            "/~img              随机\n"
+            "/~img 甘雨         单标签\n"
+            "/~img 甘雨 原神    多标签 AND（同时包含，最多3个）\n"
+            "/~img 萝莉|少女 白丝|黑丝  | 为 OR，组合匹配\n"
+            "/~img help         本帮助"
+        )
+
+    async def _bg_send():
+        await _lolicon_fetch_and_send(
+            r18=0,
+            tags=tags,
+            group_id=group_id if is_group else None,
+            user_id=user_id if not is_group else None,
+            is_group=is_group,
+            cmd_tag="img",
+        )
+
+    asyncio.create_task(_bg_send())
+    return None  # 后台异步处理
+
+
+async def cmd_img18(args, user_id, group_id, sender_name, is_group, bot_qq):
+    """R18 图片 /~img18 [标签...]（仅私聊，群聊拒绝防封号）"""
+    if is_group:
+        return "R18 图片仅限私聊使用喵~"
+
+    tags = [a.strip() for a in args if a.strip()]
+    logger.info("指令 /~img18 触发 user=%d tags=%r", user_id, tags)
+
+    if tags and tags[0].lower() in ("help", "帮助", "?", "usage"):
+        return (
+            "【/~img18 R18 图片】仅限私聊\n"
+            "/~img18             随机\n"
+            "/~img18 白丝        单标签\n"
+            "/~img18 白丝 黑丝   多标签 AND（最多3个）\n"
+            "/~img18 萝莉|少女    | 为 OR\n"
+            "/~img18 help        本帮助"
+        )
+
+    async def _bg_send():
+        await _lolicon_fetch_and_send(
+            r18=1,
+            tags=tags,
+            group_id=None,
+            user_id=user_id,
+            is_group=False,
+            cmd_tag="img18",
+        )
+
+    asyncio.create_task(_bg_send())
+    return None  # 后台异步处理
+
+# ─── 撤回记录 ──────────────────────────────────────────────
+
+async def cmd_recall(args, user_id, group_id, sender_name, is_group, bot_qq):
+    """查看最近的群消息撤回记录 /~recall [数量]"""
+    if not is_group:
+        return format_lang("recall.group_only")
+
+    count = 5
+    if args and args[0].isdigit():
+        count = min(int(args[0]), 20)
+
+    logger.info("指令 /~recall 触发 user=%d group=%d count=%d", user_id, group_id, count)
+
+    from modules.recall import get_recent_recalls
+
+    records = get_recent_recalls(group_id, count)
+    if not records:
+        return format_lang("recall.empty")
+
+    cfg = get_config()
+    lines = [f"【最近 {len(records)} 条撤回记录】"]
+    images_to_send = []
+
+    for i, r in enumerate(records, 1):
+        t = time.strftime("%H:%M:%S", time.localtime(r["time"]))
+        mid = r.get("msg_id", "")  # 消息号：可按它在 msglog 中精确匹配（撤回前已录制时）
+        uid = str(r["user_id"])
+        name = cfg.get_display_name(uid, group_id=group_id)
+
+        msg_type = r.get("type", "text")
+        if msg_type == "图片":
+            # 有本地缓存的图片：直接发送原图
+            img_path = r.get("img_path", "")
+            if img_path:
+                images_to_send.append((i, img_path, name, r))
+                content_display = "[图片已发送]"
+            else:
+                content_display = "[图片已过期]"
+        elif msg_type == "文件":
+            content_display = "[文件]"
+        else:
+            content_display = r["content"][:60] + ("..." if len(r["content"]) > 60 else "")
+            if not content_display:
+                content_display = "[无内容]"
+
+        if r.get("recalled_by") == r["user_id"]:
+            if r["user_id"] == 0:
+                op_id = str(r.get("recalled_by", ""))
+                op_name = cfg.get_display_name(op_id, group_id=group_id)
+                lines.append(f"{i}. [{t} mid={mid}] {op_name} 撤回了自己的消息: {content_display}")
+            else:
+                lines.append(f"{i}. [{t} mid={mid}] {name} 撤回了自己的消息: {content_display}")
+        else:
+            op_id = str(r.get("recalled_by", ""))
+            op_name = cfg.get_display_name(op_id, group_id=group_id)
+            target_name = name if r["user_id"] != 0 else "某人"
+            lines.append(f"{i}. [{t} mid={mid}] {op_name} 撤回了 {target_name} 的消息: {content_display}")
+
+    # 先发送图片
+    from services.sender import send_group_msg
+    for idx, img_path, name, r in images_to_send:
+        try:
+            await send_group_msg(f"[CQ:image,file=file://{img_path}]", group_id)
+        except Exception as e:
+            logger.warning("发送撤回图片失败: %s", e)
+            # 图片发送失败，更新文字行
+            fallback = f"[CQ:image,file=file://{img_path}]"
+            # 无法修改已构建的行，记录日志即可
+
+    return "\n".join(lines)
+
+
+# ─── 提醒指令 ──────────────────────────────────────────────
+
+async def cmd_remind(args, user_id, group_id, sender_name, is_group, bot_qq):
+    """设置定时提醒 /~remind <时间> <内容>"""
+    if not args or len(args) < 2:
+        return format_lang("remind.usage")
+
+    time_part = ""
+    content_part = ""
+
+    for i in range(len(args) - 1, 0, -1):
+        candidate_time = " ".join(args[:i])
+        from modules.remind import _parse_time
+        ts, err = _parse_time(candidate_time)
+        if err is None:
+            time_part = candidate_time
+            content_part = " ".join(args[i:])
+            break
+
+    if not time_part:
+        return format_lang("remind.invalid_time")
+
+    from modules.remind import _parse_time, add_reminder
+
+    ts, err = _parse_time(time_part)
+    if err:
+        return err
+
+    record = add_reminder(
+        chat_id=group_id if is_group else user_id,
+        user_id=user_id,
+        target_time=ts,
+        content=content_part,
+        is_group=is_group,
+    )
+
+    from datetime import datetime
+    target_dt = datetime.fromtimestamp(ts)
+    time_display = target_dt.strftime("%m月%d日 %H:%M")
+    logger.info("指令 /~remind 触发: user=%d time=%s content='%s'",
+               user_id, time_display, content_part[:30])
+    return f"好的喵~ 我会在 {time_display} 提醒你「{content_part[:40]}」(๑•̀ㅂ•́)و✧"
+
+
+# ─── 抽签指令 ──────────────────────────────────────────────
+
+async def cmd_chou(args, user_id, group_id, sender_name, is_group, bot_qq):
+    """随机抽取 /~抽 选项A 选项B 选项C 或 /~抽 选项A,选项B,选项C"""
+    if not args:
+        return format_lang("luck.prompt")
+
+    full = " ".join(args)
+    if "," in full:
+        options = [o.strip() for o in full.split(",") if o.strip()]
+    else:
+        options = args
+
+    if len(options) < 2:
+        return format_lang("luck.min_options")
+
+    pick = random.choice(options)
+    logger.info("指令 /~抽 触发: user=%d options=%s → '%s'", user_id, options, pick)
+
+    reactions = [
+        f"我帮你决定了喵~ 选「{pick}」！(。-`ω´-)✧",
+        f"喵呜～ 命运指引着你走向「{pick}」！",
+        f"尾巴晃了晃，指向了「{pick}」喵～",
+        f"闭上眼睛默念三秒… 就决定是「{pick}」了！",
+        f"不用纠结啦，当然是「{pick}」喵～",
+    ]
+    return random.choice(reactions)
+
+
+# ─── 群统计指令 ──────────────────────────────────────────────
+
+async def cmd_stats(args, user_id, group_id, sender_name, is_group, bot_qq):
+    """查看群聊今日统计 /~stats [昨天|send]"""
+    if not is_group:
+        return format_lang("stats.group_only")
+
+    # 手动发送日报卡片
+    if args and args[0] == "send":
+        from modules.stats import get_yesterday_stats, generate_daily_report_image
+        from datetime import datetime, timedelta
+        yesterday = datetime.now() - timedelta(days=1)
+        stats = get_yesterday_stats(group_id)
+        if not stats or stats.get("_meta", {}).get("total", 0) == 0:
+            return "昨天没有统计数据喵~"
+        card = await generate_daily_report_image(stats, group_id, yesterday.strftime("%Y.%m.%d"), f"群{group_id}")
+        if card:
+            cq = f"[CQ:image,file=file:///{card.replace(chr(92), '/')}]"
+            await (send_group_msg(cq, group_id) if is_group else send_private_msg(cq, user_id))
+            return None
+        return "日报卡片生成失败喵~"
+
+    show_yesterday = args and args[0] == "昨天"
+
+    cfg = get_config()
+
+    if show_yesterday:
+        from modules.stats import get_yesterday_stats, format_stats_report
+        stats = get_yesterday_stats(group_id)
+        report = format_stats_report(stats, cfg, group_id, title="昨日群聊日报") if stats else "昨天没有统计数据喵…"
+    else:
+        from modules.stats import get_today_stats, format_stats_report
+        stats = get_today_stats(group_id)
+        report = format_stats_report(stats, cfg, group_id, title="今日群聊统计")
+
+    logger.info("指令 /~stats 触发: user=%d group=%d yesterday=%s", user_id, group_id, show_yesterday)
+    return report
+
+
+async def cmd_unstats(args, user_id, group_id, sender_name, is_group, bot_qq):
+    """暂停群聊统计 /~unstats"""
+    if not is_group:
+        return "仅在群聊可用喵~"
+    
+    from modules.stats import set_stats_state, is_stats_enabled
+    
+    if not is_stats_enabled(group_id):
+        return "本群统计已暂停中喵~"
+    
+    set_stats_state(group_id, enabled=False)
+    logger.info("指令 /~unstats: 群=%d 统计已暂停 user=%d", group_id, user_id)
+    return "已暂停本群统计喵~ (用 /~setstats 恢复)"
+
+
+async def cmd_setstats(args, user_id, group_id, sender_name, is_group, bot_qq):
+    """恢复群聊统计 /~setstats"""
+    if not is_group:
+        return "仅在群聊可用喵~"
+    
+    from modules.stats import set_stats_state, is_stats_enabled
+    
+    if is_stats_enabled(group_id):
+        return "本群统计本来就是开启的喵~"
+    
+    set_stats_state(group_id, enabled=True)
+    logger.info("指令 /~setstats: 群=%d 统计已恢复 user=%d", group_id, user_id)
+    return "已恢复本群统计喵~"
+
+
+async def cmd_leave(args, user_id, group_id, sender_name, is_group, bot_qq):
+    """退群指令 /~leave [群号] — 收集数据 → 发送 → 重置好感度 → 退群（仅管理员）"""
+    cfg = get_config()
+    if not cfg.is_admin(user_id, group_id):
+        return "只有主人才能让我退群喵~"
+    
+    # 解析目标群号：有参数用参数，没参数用当前群
+    if args and args[0].isdigit():
+        target_gid = int(args[0])
+    elif is_group:
+        target_gid = group_id
+    else:
+        return "私聊使用时请指定群号: /~leave 群号"
+    
+    from services.sender import send_group_msg, get_ws_manager
+    from modules.leave import collect_group_data
+    from core.logger import get_logger
+    
+    _log = get_logger("leave_cmd")
+    
+    # 1. 收集数据
+    ok = await send_group_msg("📦 正在收集本群数据...", target_gid)
+    _log.info("发送进度提示 → 群%d: %s", target_gid, "成功" if ok else "失败")
+    data_parts = await collect_group_data(target_gid)
+    
+    if data_parts:
+        for title, content in data_parts:
+            msg = f"【{title}】\n{content}"
+            if len(msg) > 2000:
+                msg = msg[:1990] + "...\n(截断)"
+            ok = await send_group_msg(msg, target_gid)
+            _log.info("发送 %s → 群%d: %s (%d字)", title, target_gid, "成功" if ok else "失败", len(msg))
+    else:
+        await send_group_msg("本群无留存数据喵~", target_gid)
+    
+    # 2. 重置好感度
+    import json
+    from pathlib import Path
+    fav_path = Path(__file__).resolve().parent.parent / "data" / "fav.json"
+    fav_count = 0
+    if fav_path.exists():
+        try:
+            data = json.loads(fav_path.read_text(encoding="utf-8"))
+            prefix = f"g{target_gid}:"
+            to_del = [k for k in data if k.startswith(prefix)]
+            for k in to_del:
+                del data[k]
+            fav_count = len(to_del)
+            if fav_count:
+                fav_path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+        except Exception:
+            pass
+    
+    # 3. 清理内存状态
+    try:
+        from core.context_manager import get_context_mgr
+        get_context_mgr().clear_context(target_gid)
+    except Exception:
+        pass
+    try:
+        from modules.preset import clear_preset
+        clear_preset(target_gid)
+    except Exception:
+        pass
+    
+    await send_group_msg(f"✅ remove group done... (重置好感度 {fav_count} 人)", target_gid)
+    
+    # 4. 退群
+    try:
+        mgr = get_ws_manager()
+        await mgr.call_api("set_group_leave", {"group_id": target_gid})
+        _log.info("退群成功: 群=%d user=%d", target_gid, user_id)
+    except Exception as e:
+        _log.error("退群API调用失败: %s", e)
+        return f"退群失败: {e}"
+    
+    return None  # 不发返回值，_handle_command_route 会跳过
+
+
+# ─── Minecraft 日志分析（零上下文）─────────────────────────────
+
+async def cmd_analyze(args, user_id, group_id, sender_name, is_group, bot_qq):
+    """
+    零上下文分析 /~analyze <日志内容>
+    直接发给 LLM，不注入任何聊天记录、记忆、架构上下文。
+    """
+    if not args:
+        return "用法: /~analyze <日志内容>\n直接粘贴 Minecraft 日志，零上下文分析。"
+    
+    content = " ".join(args)
+    from services.llm import call_llm_raw
+    prompt = (
+        "你是一个 Minecraft 日志分析助手。请分析以下日志，找出问题、错误、警告，并给出修复建议。"
+        "只基于当前提供的日志内容进行分析，不要引入任何外部知识或假设。\n\n"
+        f"日志内容:\n{content}"
+    )
+    reply = await call_llm_raw(prompt)
+    if not reply:
+        return format_lang("analyze.fail")
+    return reply
+
+
+# ─── 提示词注入管理 ──────────────────────────────────────────
+
+async def cmd_preset(args, user_id, group_id, sender_name, is_group, bot_qq):
+    """查看或清除系统提示词注入 /~preset [show|clear]"""
+    from modules.preset import get_preset, clear_preset
+
+    cfg = get_config()
+    if not cfg.is_admin(user_id, group_id):
+        return format_lang("preset.permission")
+
+    action = args[0].lower() if args else "show"
+    chat_id = group_id if is_group else user_id
+
+    if action == "clear":
+        cleared = clear_preset(chat_id)
+        logger.info("指令 /~preset clear 用户=%d cleared=%s", user_id, cleared)
+        return format_lang("preset.cleared") if cleared else format_lang("preset.no_preset")
+
+    preset = get_preset(chat_id)
+    if preset:
+        return f"【当前注入的提示词】({len(preset)}字)\n{preset[:500]}"
+    else:
+        return format_lang("preset.empty")
+
+
+# ─── 五子棋 ─────────────────────────────────────────────────
+
+async def _wzq_render_and_send(chat_id: int, is_group: bool, group_id: int, user_id: int, cfg):
+    """背景生成棋盘卡片并发送"""
+    from modules import wzq as g
+    img = await g.render_board(chat_id, cfg)
+    if img:
+        cq = f"[CQ:image,file=file:///{img.replace(chr(92), '/')}]"
+        await (send_group_msg(cq, group_id) if is_group else send_private_msg(cq, user_id))
+
+
+_GAME_CN = {"go": "围棋", "wzq": "五子棋", "xq": "中国象棋"}
+
+
+def _room_links(kind: str, chat_id: int, players) -> tuple:
+    """取（或新建）房间号，并生成观战链接与各人对局链接。
+
+    返回 (房间号, 观战链接, {uid: 对局链接})；服务不可用时返回空串/空字典。
+    """
+    try:
+        from services.game_web import ensure_room, play_link, spectate_link
+        code = ensure_room(kind, chat_id, is_group=chat_id in get_config().group_list)
+        return (code, spectate_link(code),
+                {int(u): play_link(code, int(u)) for u in players})
+    except Exception as e:
+        logger.warning("生成棋局链接失败: %s", e)
+        return "", "", {}
+
+
+async def _announce_room(kind: str, chat_id: int, players: list, is_group: bool,
+                         group_id: int = 0, me_uid: int = 0, mode_text: str = "") -> str:
+    """开赛分发。
+
+    - 群里：返回的文本带**观战链接**（由调用方发到群里）
+    - 双方：各自的对局链接**私聊**发过去
+    players: [(uid, 昵称, 执子说明)]
+    """
+    from services.sender import send_private_msg
+    code, spec, links = _room_links(kind, chat_id, [p[0] for p in players])
+    if not code:
+        return ""
+    title = f"{_GAME_CN.get(kind, '棋局')}房间 {code}"
+    roster = " vs ".join(str(p[1]) for p in players)
+    if roster:
+        title += f"｜{roster}"
+    if mode_text:
+        title += f"｜{mode_text}"
+
+    for uid, _name, role in players:
+        link = links.get(int(uid))
+        if not link:
+            continue
+        if not is_group and int(uid) == int(me_uid):
+            continue                     # 私聊开局：发起人的链接直接放回复里
+        try:
+            await send_private_msg(
+                f"{title}\n你执{role}。专属对局链接（别转发）：\n{link}", int(uid))
+        except Exception as e:
+            logger.warning("对局链接私聊失败 uid=%s: %s", uid, e)
+
+    if is_group:
+        return f"{title}\n观战链接（点开即围观，可转发）：{spec}"
+    own = links.get(int(me_uid), "")
+    return f"{title}\n你的对局链接（别转发）：\n{own}" if own else title
+
+
+def _link_text(kind: str, chat_id: int, uid: int, has_game: bool) -> str:
+    """`link` 子命令回复：房间号 + 自己的对局链接 + 观战链接"""
+    if not has_game:
+        return "这里还没有对局喵~ 先开一局"
+    try:
+        from services.game_web import ensure_room, play_link, spectate_link
+    except Exception as e:
+        return f"棋局网页服务未启用喵~（{e}）"
+    code = ensure_room(kind, chat_id, is_group=chat_id in get_config().group_list)
+    return (f"房间号 {code}\n"
+            f"你的对局链接（别转发）：\n{play_link(code, uid)}\n"
+            f"观战链接（可发群里）：\n{spectate_link(code)}")
+
+
+def _parse_opponent(text: str, group_id: int, cfg) -> int | None:
+    """从 @某人 / 昵称 / QQ 号 里解析对手的 QQ"""
+    s = str(text or "").strip()
+    if not s:
+        return None
+    m = re.search(r"(\d{4,12})", s)
+    if m:
+        return int(m.group(1))
+    name = s.lstrip("@").strip()
+    raw = name
+    # 去掉可能附带的其它词（如"/~xq duel 某某 困难"）
+    name = name.split()[0] if name else ""
+    if not name:
+        return None
+    per = (cfg.group_nicknames or {}).get(str(group_id), {}) if group_id else {}
+    for qq, nick in (per or {}).items():
+        if nick == name or nick == raw:
+            return int(qq)
+    for qq, nick in (cfg.qq_name_map or {}).items():
+        if nick == name or nick == raw:
+            return int(qq)
+    return None
+
+
+async def cmd_watch(args, user_id, group_id, sender_name, is_group, bot_qq):
+    """/~观战 <房间号> —— 取某个棋局房间的观战链接"""
+    if not args:
+        return ("用法：/~观战 <房间号>\n"
+                "房间号是开局时 bot 给出的 4 位编号（不含 0/O/1/I/L）")
+    code = str(args[0]).strip().upper()
+    try:
+        from services.game_web import KIND_LABEL, room_of, spectate_link
+    except Exception as e:
+        return f"棋局网页服务未启用喵~（{e}）"
+    room = room_of(code)
+    if not room:
+        return f"找不到房间 {code} 喵~ 房间号是 4 位（不含 0/O/1/I/L）"
+    kind_cn = KIND_LABEL.get(room.get("kind"), "棋局")
+    return f"{kind_cn}房间 {code} 观战链接（点开即围观）：\n{spectate_link(code)}"
+
+
+async def cmd_wzq(args, user_id, group_id, sender_name, is_group, bot_qq):
+    """
+    五子棋 /~wzq <操作>
+      duel @某人     发起挑战
+      ai <难度>     人机对战
+      accept         接受挑战
+      cancel/unduel  取消挑战
+      <坐标>         落子 (如 H8, 8,8)
+      board          查看棋盘
+      surrender      认输
+      undo           申请悔棋
+      status         查看状态
+      admin clear    强制清除
+    """
+    chat_id = group_id if is_group else user_id
+    from modules import wzq as g
+
+    if not args:
+        game = g.get_game(chat_id)
+        if game and game.status == "playing":
+            args = ["board"]
+        else:
+            return (
+                "五子棋 /~wzq\n"
+                "  duel @某人 [nofb] 发起挑战(可选无禁手)\n"
+                "  ai 新手/普通/困难/专家 [nofb]\n"
+                "  accept      接受挑战\n"
+                "  cancel/unduel 取消未接受的挑战\n"
+                "  <坐标>      落子 (H8 / 8,8)\n"
+                "  board       查看棋盘\n"
+                "  surrender   认输\n"
+                "  undo        悔棋\n"
+                "  link        取房间号与网页链接\n"
+                "  status      对局信息\n"
+                "  admin clear 强制结束本群棋局(仅主人)"
+            )
+
+    action = args[0].lower()
+    cfg = get_config()
+
+    # ── 人机对战 ──
+    if action in ("ai", "人机"):
+        if len(args) < 2:
+            return "用法: /~wzq ai <难度>\n难度: 新手 普通 困难 专家"
+        diff = args[1]
+        diff_map = {"新手": "新手", "普通": "普通", "困难": "困难", "专家": "专家", "easy": "新手", "normal": "普通", "hard": "困难", "expert": "专家"}
+        diff = diff_map.get(diff, diff)
+        if diff not in ("新手", "普通", "困难", "专家"):
+            return f"未知难度: {diff}\n可选: 新手 普通 困难 专家"
+        nofb = args[-1].lower() in ("nofb", "无禁手", "noforbidden")
+        result = g.create_duel_ai(chat_id, user_id, diff, forbidden=not nofb)
+        if result.startswith("started_ai"):
+            diff_name = result.split(":")[1]
+            async def _bg_ai_start():
+                img = await g.render_board(chat_id, cfg)
+                if img:
+                    cq = f"[CQ:image,file=file:///{img.replace(chr(92), '/')}]"
+                    await (send_group_msg(cq, group_id) if is_group else send_private_msg(cq, user_id))
+            asyncio.create_task(_bg_ai_start())
+            base = format_lang("wzq.start", diff=diff_name)
+            uname = cfg.get_display_name(str(user_id), group_id=group_id if is_group else 0)
+            ann = await _announce_room("wzq", chat_id, [(user_id, uname, "黑")], is_group,
+                                       group_id, me_uid=user_id, mode_text=f"人机·{diff_name}")
+            return f"{base}\n{ann}" if ann else base
+        return result
+
+    # ── 发起挑战 ──
+    if action == "duel":
+        if len(args) < 2:
+            return "用法: /~wzq duel @某人"
+
+        # 从参数中提取 QQ 号（支持 @昵称 反向查映射）
+        opponent = " ".join(args[1:])
+        white_id = _parse_opponent(opponent, group_id if is_group else 0, cfg)
+        if not white_id:
+            return format_lang("wzq.user_not_found", name=opponent.lstrip("@"))
+
+        result = g.create_duel(chat_id, user_id, white_id,
+                                forbidden=args[-1].lower() not in ("nofb", "无禁手", "noforbidden"))
+        if result.startswith("waiting"):
+            async def _bg_duel():
+                import asyncio as _a
+                await _a.sleep(0.5)
+                img = await g.render_board(chat_id, cfg)
+                if img:
+                    cq = f"[CQ:image,file=file:///{img.replace(chr(92), '/')}]"
+                    await (send_group_msg(cq, group_id) if is_group else send_private_msg(cq, user_id))
+            asyncio.create_task(_bg_duel())
+            return (f"挑战已发起！等待 [CQ:at,qq={white_id}] 接受 (/~wzq accept) "
+                    f"或拒绝 (/~wzq decline)")
+        return result
+
+    # ── 接受 ──
+    if action == "accept":
+        result = g.accept_duel(chat_id, user_id)
+        if result == "started":
+            game = g.get_game(chat_id)
+            gid = group_id if is_group else 0
+            name_b = cfg.get_display_name(str(game.black), group_id=gid)
+            name_w = cfg.get_display_name(str(game.white), group_id=gid)
+            ann = await _announce_room("wzq", chat_id,
+                                       [(game.black, name_b, "黑"), (game.white, name_w, "白")],
+                                       is_group, group_id, me_uid=user_id, mode_text="人人对战")
+
+            async def _bg():
+                img = await g.render_board(chat_id, cfg)
+                if img:
+                    cq = f"[CQ:image,file=file:///{img.replace(chr(92), '/')}]"
+                    await (send_group_msg(cq, group_id) if is_group else send_private_msg(cq, user_id))
+            asyncio.create_task(_bg())
+            head = "对局开始！黑先白后，五子连珠者胜。"
+            return f"{head}\n{ann}" if ann else head
+        return result
+
+    # ── 拒绝 ──
+    if action == "decline":
+        return g.decline_duel(chat_id, user_id)
+
+    # ── 取消 ──
+    if action in ("cancel", "unduel"):
+        return g.cancel_duel(chat_id, user_id)
+
+    # ★ admin 强制清除本群所有棋局
+    if action == "admin":
+        if not cfg.is_admin(user_id, group_id):
+            return "只有主人才能用这个喵~"
+        sub = args[1] if len(args) > 1 else ""
+        if sub == "clear":
+            game = g.get_game(chat_id)
+            if not game:
+                return "当前没有对局喵~"
+            g.force_end(chat_id)
+            return f"已强制结束本群棋局 (状态={game.status})"
+        return "用法: /~wzq admin clear  强制清除本群所有对局"
+
+    # ── 房间链接 ──
+    if action in ("link", "链接", "网页", "房间"):
+        game = g.get_game(chat_id)
+        if not game:
+            return "这里还没有五子棋对局喵~ 用 /~wzq ai 普通 开局"
+        side = ""
+        if user_id == game.black:
+            side = "（你是黑方）"
+        elif user_id == game.white:
+            side = "（你是白方）"
+        return _link_text("wzq", chat_id, user_id, True) + f"\n{side}" if side else \
+            _link_text("wzq", chat_id, user_id, True)
+
+    # ── 落子 ──
+    coord = g.parse_coord(action if len(args) == 1 else " ".join(args))
+    if coord:
+        row, col = coord
+        ok, msg = g.make_move(chat_id, user_id, row, col)
+        if ok:
+            # ★ 玩家落子：先渲染发送棋盘，再让 AI 走（避免图片顺序颠倒）
+            img = await g.render_board(chat_id, cfg)
+            if img:
+                cq = f"[CQ:image,file=file:///{img.replace(chr(92), '/')}]"
+                await (send_group_msg(cq, group_id) if is_group else send_private_msg(cq, user_id))
+
+            if msg == "win":
+                game = g.get_game(chat_id)
+                winner_name = cfg.get_display_name(str(game.white if game.winner == 2 else game.black), group_id=group_id if is_group else 0)
+                return f"五连！{winner_name} 获胜！"
+            if msg == "draw":
+                return "棋盘满了，平局！"
+            if msg.startswith("forbidden:"):
+                reason = msg.split(":", 1)[1]
+                game = g.get_game(chat_id)
+                winner = cfg.get_display_name(str(game.white), group_id=group_id if is_group else 0)
+                return f"禁手犯规({reason})！{winner} 获胜！"
+
+            # AI 自动走棋
+            game = g.get_game(chat_id)
+            if game and game.ai_difficulty and game.turn == 2 and game.status == "playing":
+                async def _ai_turn():
+                    ai_ok, ai_msg = await g.ai_move_async(chat_id)
+                    if ai_ok:
+                        img = await g.render_board(chat_id, cfg)
+                        if img:
+                            cq = f"[CQ:image,file=file:///{img.replace(chr(92), '/')}]"
+                            await (send_group_msg(cq, group_id) if is_group else send_private_msg(cq, user_id))
+                        if ai_msg == "win":
+                            ai_game = g.get_game(chat_id)
+                            if ai_game.winner == 2:
+                                await (send_group_msg("AI 获胜！", group_id) if is_group else send_private_msg("AI 获胜！", user_id))
+                            elif ai_game.winner == 1:
+                                await (send_group_msg("你赢了！", group_id) if is_group else send_private_msg("你赢了！", user_id))
+                        elif ai_msg.startswith("forbidden:"):
+                            await (send_group_msg("AI 禁手犯规，你赢了！", group_id) if is_group else send_private_msg("AI 禁手犯规，你赢了！", user_id))
+                    else:
+                        logger.warning("AI turn failed: %s", ai_msg)
+                asyncio.create_task(_ai_turn())
+            return None
+        return msg
+
+    # ── 棋盘 ──
+    if action == "board":
+        async def _bg():
+            img = await g.render_board(chat_id, cfg)
+            if img:
+                cq = f"[CQ:image,file=file:///{img.replace(chr(92), '/')}]"
+                await (send_group_msg(cq, group_id) if is_group else send_private_msg(cq, user_id))
+        asyncio.create_task(_bg())
+        return None
+
+    # ── 认输 ──
+    if action == "surrender":
+        ok, msg = g.surrender(chat_id, user_id)
+        if ok:
+            loser = cfg.get_display_name(str(user_id), group_id=group_id if is_group else 0)
+            return f"{loser} 认输了！"
+        return msg
+
+    # ── 悔棋 ──
+    if action == "undo":
+        game = g.get_game(chat_id)
+        # ★ 如果对方已有悔棋申请，当前用户发送 undo = 确认悔棋
+        if game and game.undo_request is not None and game.undo_request != user_id:
+            ok, msg_res = g.confirm_undo(chat_id, user_id)
+            if ok:
+                async def _bg_undo():
+                    img = await g.render_board(chat_id, cfg)
+                    if img:
+                        cq = f"[CQ:image,file=file:///{img.replace(chr(92), '/')}]"
+                        await (send_group_msg(cq, group_id) if is_group else send_private_msg(cq, user_id))
+                asyncio.create_task(_bg_undo())
+                return msg_res
+            return msg_res
+
+        result = g.request_undo(chat_id, user_id)
+        if result == "undo_request":
+            opponent = game.white if user_id == game.black else game.black
+            return f"悔棋申请已发送，等待 [CQ:at,qq={opponent}] 同意 (/~wzq undo)"
+        return result
+
+    # ── 状态 ──
+    if action == "status":
+        game = g.get_game(chat_id)
+        if not game:
+            return format_lang("wzq.no_game")
+        bn = cfg.get_display_name(str(game.black), group_id=group_id if is_group else 0)
+        wn = cfg.get_display_name(str(game.white), group_id=group_id if is_group else 0)
+        return f"黑方 {bn} vs 白方 {wn} | 手数 {game.move_count} | 状态 {game.status}"
+
+    # ── 历史记录 ──
+    if action == "history":
+        # 参数: [数量] [board] — board 渲染指定编号的棋盘
+        count = 5; show_board_idx = 0
+        for a in args[1:]:
+            if a.lower() in ("board", "棋盘", "b"):
+                if show_board_idx == 0:
+                    show_board_idx = 1  # 默认第1局
+            elif a.isdigit():
+                n = min(int(a), 20)
+                if show_board_idx == 0:
+                    count = n
+                else:
+                    show_board_idx = n  # 指定第N局
+
+        records = g.get_history(chat_id, max(count, show_board_idx))
+        if not records:
+            return format_lang("wzq.no_records")
+
+        # 渲染特定对局的棋盘
+        if show_board_idx > 0:
+            idx = show_board_idx - 1
+            if idx >= len(records):
+                return format_lang("wzq.only_n_records", count=len(records))
+            async def _bg_hist():
+                img = await g.render_history_board(records[idx], cfg)
+                if img:
+                    cq = f"[CQ:image,file=file:///{img.replace(chr(92), '/')}]"
+                    await (send_group_msg(cq, group_id) if is_group else send_private_msg(cq, user_id))
+            asyncio.create_task(_bg_hist())
+            return None
+
+        # 文字列表
+        lines = [f"五子棋记录 (最近{min(count, len(records))}场)"]
+        lines.append("  /~wzq history <编号> board 查看棋盘")
+        for i, r in enumerate(records[:count], 1):
+            bn = cfg.get_display_name(str(r["black"]), group_id=group_id if is_group else 0)
+            wn = cfg.get_display_name(str(r["white"]), group_id=group_id if is_group else 0)
+            if r["winner"] == 1:
+                result = f"{bn} 胜"
+            elif r["winner"] == 2:
+                result = f"{wn} 胜"
+            else:
+                result = "平局"
+            lines.append(f"  {i}. [{r['time']}] {bn} vs {wn} -> {result} ({r['moves']}手)")
+        return "\n".join(lines)
+
+    # ── 测试渲染 ──
+    if action == "test":
+        async def _bg_test():
+            img = await g.render_test_board(cfg)
+            if img:
+                cq = f"[CQ:image,file=file:///{img.replace(chr(92), '/')}]"
+                await (send_group_msg(cq, group_id) if is_group else send_private_msg(cq, user_id))
+        asyncio.create_task(_bg_test())
+        return None
+
+    return f"未知操作: {action}\n使用 /~wzq 查看帮助"
+
+
+# ─── 翻译 ───────────────────────────────────────────────────
+
+async def cmd_translate(args, user_id, group_id, sender_name, is_group, bot_qq):
+    """
+    翻译 /~tr <目标语言> <文本>
+      /~tr en 你好
+      /~tr 中文 hello
+      /~tr jp こんにちは
+    """
+    if len(args) < 2:
+        return "用法: /~tr <目标语言> <文本>\n例如: /~tr en 你好\n     /~tr 中文 hello"
+
+    # 语言别名映射
+    LANG_MAP = {
+        "en": "English", "英文": "English", "英语": "English", "english": "English",
+        "zh": "Chinese", "中文": "Chinese", "汉语": "Chinese", "chinese": "Chinese",
+        "jp": "Japanese", "ja": "Japanese", "日文": "Japanese", "日语": "Japanese", "japanese": "Japanese",
+        "kr": "Korean", "ko": "Korean", "韩文": "Korean", "韩语": "Korean", "korean": "Korean",
+        "fr": "French", "法文": "French", "法语": "French", "french": "French",
+        "de": "German", "德文": "German", "德语": "German", "german": "German",
+    }
+    target = args[0].lower()
+    lang = LANG_MAP.get(target)
+    if not lang:
+        return f"不支持的语言: {target}\n支持: en/zh/jp/kr/fr/de 或 中文/英文/日文/韩文..."
+
+    text = " ".join(args[1:])
+
+    logger.info("翻译: %s → %s, text='%s'", text[:30], lang, text[:50])
+
+    # 用廉价模型做翻译
+    from services.llm import call_llm
+    try:
+        result = await call_llm(
+            model_cfg=get_config().judge_model,
+            messages=[{
+                "role": "user",
+                "content": f"Translate the following text to {lang}. Output ONLY the translation, no explanation, no quotation marks.\n\n{text}",
+            }],
+            max_tokens=1200,
+            temperature=0.1,
+        )
+        translation = result.strip().strip('"').strip("'").strip()
+        return f"[{lang}] {translation}"
+    except Exception as e:
+        logger.error("翻译失败: %s", e)
+        return format_lang("translate.fail")
+
+
+# ─── 围棋 ────────────────────────────────────────────────────
+
+async def cmd_go(args, user_id, group_id, sender_name, is_group, bot_qq):
+    """围棋 9/13/19 路 /~go [start [难度] [尺寸]|坐标|pass|board|resign|link]（群聊/私聊均可用）"""
+    from modules import go_game as G
+    from services.sender import send_group_msg, send_private_msg
+
+    cfg = get_config()
+    chat_id = group_id if is_group else user_id
+
+    async def _send(msg: str):
+        await (send_group_msg(msg, group_id) if is_group else send_private_msg(msg, user_id))
+
+    async def _send_board():
+        img = await G.render_board(chat_id)
+        if img:
+            await _send(f"[CQ:image,file=file:///{img.replace(chr(92), '/')}]")
+        return img
+
+    if not args:
+        return (
+            "围棋 /~go <操作>\n"
+            "  start [难度] [尺寸]  开始新对局\n"
+            "     难度：新手/普通/困难/专家（默认普通）\n"
+            "     尺寸：9/13/19 或 小/中/大（默认 19 标准盘）\n"
+            "  <坐标>        落子（D4 / 4,4，字母跳过 I）\n"
+            "  pass          停一手（双方连续 pass 即终局数子）\n"
+            "  board         查看棋盘\n"
+            "  duel @某人 [难度]  邀请群友对弈（双人）\n"
+            "  link          取房间号与网页链接\n"
+            "  resign        认输"
+        )
+
+    action = args[0].lower()
+
+    if action in ("start", "开始", "开局"):
+        diff_raw = ""
+        for tok in args[1:]:
+            if not diff_raw and G.resolve_difficulty(tok):
+                diff_raw = tok
+            else:
+                opts = " / ".join(v["label"] for v in G.DIFFICULTIES.values())
+                return f"参数「{tok}」不认识喵~ 难度可选：{opts}"
+        r = G.start_game(user_id, chat_id, diff_raw or G.DEFAULT_DIFFICULTY)
+        if not r.startswith("ok"):
+            return r
+        label = r.split(":", 1)[1] if ":" in r else "普通"
+        gid = group_id if is_group else 0
+        uname = cfg.get_display_name(str(user_id), group_id=gid)
+        ann = await _announce_room("go", chat_id, [(user_id, uname, "黑")], is_group,
+                                   group_id, me_uid=user_id, mode_text=f"人机·{label}")
+        try:
+            img = await G.render_board(chat_id)
+            cq = f"[CQ:image,file=file:///{img.replace(chr(92), '/')}]" if img else ""
+            await _send(f"围棋开局！{G.BOARD_SIZE}×{G.BOARD_SIZE} 标准盘，你执黑先行，AI 难度「{label}」\n"
+                        f"{ann}\n落子用 /~go D4（字母跳过 I）\n{cq}")
+            return None
+        except Exception as e:
+            return f"棋盘渲染失败喵: {e}"
+
+    # ── 邀请群友对弈（双人） ──
+    if action in ("duel", "对战", "挑战"):
+        if len(args) < 2:
+            return "用法：/~go duel @某人 [难度]"
+        opp = _parse_opponent(args[1], group_id if is_group else 0, cfg)
+        if not opp:
+            return f"没认出对手「{args[1]}」喵~ 用 @某人 或直接写 QQ 号"
+        if opp == user_id:
+            return "不能自己跟自己下喵~"
+        diff_raw = ""
+        for tok in args[2:]:
+            if not diff_raw and G.resolve_difficulty(tok):
+                diff_raw = tok
+            else:
+                return f"参数「{tok}」不认识喵~"
+        r = G.start_game(user_id, chat_id, diff_raw or G.DEFAULT_DIFFICULTY,
+                         opponent_id=opp)
+        if not r.startswith("ok"):
+            return r
+        gid = group_id if is_group else 0
+        n1 = cfg.get_display_name(str(user_id), group_id=gid)
+        n2 = cfg.get_display_name(str(opp), group_id=gid)
+        ann = await _announce_room("go", chat_id,
+                                   [(user_id, n1, "黑"), (opp, n2, "白")], is_group,
+                                   group_id, me_uid=user_id, mode_text="人人对战")
+        try:
+            img = await G.render_board(chat_id)
+            cq = f"[CQ:image,file=file:///{img.replace(chr(92), '/')}]" if img else ""
+            await _send(f"围棋对战开始！{G.BOARD_SIZE}×{G.BOARD_SIZE} 标准盘，{n1} 执黑先行。\n{ann}\n{cq}")
+            return None
+        except Exception as e:
+            return f"棋盘渲染失败喵: {e}"
+
+    if action in ("link", "链接", "网页", "房间"):
+        return _link_text("go", chat_id, user_id, G.get_game(chat_id) is not None)
+
+    if action in ("board", "棋盘", "查看"):
+        game = G.get_game(chat_id)
+        if not game:
+            return "这里没有围棋对局喵~ 用 /~go start 开局"
+        await _send_board()
+        return f"当前局面 · 手数 {game.get('move_count', 0)}"
+
+    if action in ("pass", "停一手", "过"):
+        ok, msg, _ = G.do_pass(user_id, chat_id)
+        if not ok:
+            return msg
+        game = G.get_game(chat_id)
+        if game and game.get("status") == "finished":
+            tail = G.end_game(chat_id)
+            await _send_board()
+            return f"{msg}\n{tail}"
+        await _send_board()
+        return msg
+
+    if action in ("resign", "认输"):
+        return G.resign_game(user_id, chat_id)
+
+    # 落子
+    ok, msg, need_render = G.make_move(user_id, chat_id, " ".join(args))
+    if need_render:
+        await _send_board()
+    return msg
+
+
+# ─── 中国象棋 ────────────────────────────────────────────────
+
+async def cmd_xq(args, user_id, group_id, sender_name, is_group, bot_qq):
+    """中国象棋 /~xq [start [难度]|走法|board|resign|history]（群聊/私聊均可用）"""
+    # 注：原代码 import 的 _build_svg / INIT_BOARD 两个名字在模块里并不存在
+    # （实际是 _board_to_svg / build_initial_svg）—— 这是 /~xq 一直 ImportError 的根因
+    from modules.chinese_chess import (
+        start_game, make_move, resign_game, show_board, show_history, get_game,
+        build_initial_svg, _svg_to_png, _ROOT, wait_render,
+        resolve_difficulty, DEFAULT_DIFFICULTY, DIFFICULTIES,
+    )
+    from services.sender import send_group_msg, send_private_msg
+
+    cfg = get_config()
+
+    # 私聊也能玩：对局按 chat_id 隔离（私聊时用 user_id）
+    chat_id = group_id if is_group else user_id
+
+    async def _send(msg: str):
+        await (send_group_msg(msg, group_id) if is_group else send_private_msg(msg, user_id))
+
+    if not args:
+        return (
+            "中国象棋 /~xq <操作>\n"
+            "  start [难度]  开始新对局（新手/普通/困难/专家，默认普通）\n"
+            "  <走法>        炮二平五 / h2e2\n"
+            "  board         查看棋盘\n"
+            "  duel @某人 [难度]  邀请群友对弈（双人）\n"
+            "  link          取房间号与网页链接\n"
+            "  resign        认输\n"
+            "  history       走棋记录"
+        )
+
+    action = args[0].lower()
+
+    if action == "start":
+        diff_raw = args[1] if len(args) > 1 else ""
+        if diff_raw and not resolve_difficulty(diff_raw):
+            opts = " / ".join(v["label"] for v in DIFFICULTIES.values())
+            return f"难度「{diff_raw}」不认识喵~ 可选：{opts}"
+        result = start_game(user_id, chat_id, diff_raw or DEFAULT_DIFFICULTY)
+        if not result.startswith("ok"):
+            return result
+        label = result.split(":", 1)[1] if ":" in result else "普通"
+        gid = group_id if is_group else 0
+        uname = cfg.get_display_name(str(user_id), group_id=gid)
+        ann = await _announce_room("xq", chat_id, [(user_id, uname, "红")], is_group,
+                                   group_id, me_uid=user_id, mode_text=f"人机·{label}")
+        try:
+            svg = build_initial_svg()
+            out = str(_ROOT / "data" / "img_temp" / f"xq_{chat_id}.png")
+            await _svg_to_png(svg, out)
+            cq = f"[CQ:image,file=file:///{out.replace(chr(92), '/')}]"
+            await _send(f"对局开始！你执红方，AI 难度「{label}」，请落子喵~\n{ann}\n{cq}")
+            return None
+        except Exception as e:
+            return f"棋盘渲染失败喵: {e}"
+
+    # ── 邀请群友对弈（双人） ──
+    if action in ("duel", "对战", "挑战"):
+        if len(args) < 2:
+            return "用法：/~xq duel @某人 [难度]"
+        opp = _parse_opponent(args[1], group_id if is_group else 0, cfg)
+        if not opp:
+            return f"没认出对手「{args[1]}」喵~ 用 @某人 或直接写 QQ 号"
+        if opp == user_id:
+            return "不能自己跟自己下喵~"
+        diff_raw = ""
+        for tok in args[2:]:
+            if resolve_difficulty(tok):
+                diff_raw = tok
+                break
+        result = start_game(user_id, chat_id, diff_raw or DEFAULT_DIFFICULTY, opponent_id=opp)
+        if not result.startswith("ok"):
+            return result
+        label = result.split(":", 1)[1] if ":" in result else "普通"
+        gid = group_id if is_group else 0
+        n1 = cfg.get_display_name(str(user_id), group_id=gid)
+        n2 = cfg.get_display_name(str(opp), group_id=gid)
+        ann = await _announce_room("xq", chat_id,
+                                   [(user_id, n1, "红"), (opp, n2, "黑")], is_group,
+                                   group_id, me_uid=user_id, mode_text="人人对战")
+        try:
+            svg = build_initial_svg()
+            out = str(_ROOT / "data" / "img_temp" / f"xq_{chat_id}.png")
+            await _svg_to_png(svg, out)
+            cq = f"[CQ:image,file=file:///{out.replace(chr(92), '/')}]"
+            await _send(f"象棋对战开始！{n1} 执红先行（{label}）。\n{ann}\n{cq}")
+            return None
+        except Exception as e:
+            return f"棋盘渲染失败喵: {e}"
+
+    if action == "board":
+        msg, img = show_board(chat_id)
+        if img:
+            await wait_render()   # 渲染是异步的，不等就会发出上一手的旧盘面
+            cq = f"[CQ:image,file=file:///{img.replace(chr(92), '/')}]"
+            await _send(cq)
+        return msg
+
+    if action in ("link", "链接", "网页", "房间"):
+        return _link_text("xq", chat_id, user_id, game is not None)
+
+    if action == "resign":
+        return resign_game(user_id, chat_id)
+
+    if action == "history":
+        return show_history(chat_id)
+
+    # 走棋
+    notation = " ".join(args)
+    ok, msg, img = make_move(user_id, chat_id, notation)
+    if img:
+        try:
+            await wait_render()   # 渲染是异步的，不等就会发出上一手的旧盘面
+            cq = f"[CQ:image,file=file:///{img.replace(chr(92), '/')}]"
+            await _send(cq)
+        except Exception:
+            pass
+    return msg
+
+
+async def cmd_countdown(args, user_id, group_id, sender_name, is_group, bot_qq):
+    """
+    倒计时 /~countdown
+      add <日期> <事件>     添加倒计时
+      list                  查看所有
+      del <编号>            删除
+      无参数                 显示最近的
+    """
+    import datetime as _dt
+
+    if not args:
+        items = _load_countdowns()
+        if not items:
+            return format_lang("countdown.empty_list")
+        lines = ["【倒计时】"]
+        now = _dt.datetime.now()
+        for i, item in enumerate(items, 1):
+            try:
+                target = _dt.datetime.strptime(item["date"], "%Y-%m-%d")
+                days = (target - now).days
+                sign = "已过" if days < 0 else "还有"
+                days_str = f"{sign} {abs(days)} 天"
+            except Exception:
+                days_str = "?"
+            lines.append(f"  {i}. [{item['date']}] {item['event']}  ({days_str})")
+        return "\n".join(lines)
+
+    action = args[0].lower()
+
+    if action == "list":
+        items = _load_countdowns()
+        if not items:
+            return format_lang("countdown.empty_single")
+        lines = ["【倒计时列表】"]
+        now = _dt.datetime.now()
+        for i, item in enumerate(items, 1):
+            try:
+                target = _dt.datetime.strptime(item["date"], "%Y-%m-%d")
+                days = (target - now).days
+                sign = "已过" if days < 0 else "还有"
+                days_str = f"{sign} {abs(days)} 天"
+            except Exception:
+                days_str = "?"
+            lines.append(f"  {i}. [{item['date']}] {item['event']}  ({days_str})")
+        return "\n".join(lines)
+
+    if action == "del" or action == "delete":
+        if len(args) < 2:
+            return "用法: /~countdown del <编号>"
+        try:
+            idx = int(args[1]) - 1
+        except ValueError:
+            return format_lang("countdown.delete_invalid_id")
+        items = _load_countdowns()
+        if idx < 0 or idx >= len(items):
+            return format_lang("countdown.delete_out_of_range")
+        removed = items.pop(idx)
+        _save_countdowns(items)
+        return f"已删除: [{removed['date']}] {removed['event']}"
+
+    if action == "add":
+        if len(args) < 3:
+            return "用法: /~countdown add <日期> <事件>\n例如: /~countdown add 2026-12-25 圣诞节"
+        date_str = args[1]
+        event = " ".join(args[2:])
+    else:
+        # 快捷模式: /~countdown 2026-12-25 圣诞节
+        date_str = args[0]
+        event = " ".join(args[1:])
+
+    # 验证日期
+    try:
+        _dt.datetime.strptime(date_str, "%Y-%m-%d")
+    except ValueError:
+        return f"日期格式错误: {date_str}\n请使用 YYYY-MM-DD 格式，如 2026-12-25"
+
+    items = _load_countdowns()
+    items.append({"date": date_str, "event": event})
+    _save_countdowns(items)
+
+    target = _dt.datetime.strptime(date_str, "%Y-%m-%d")
+    days = (target - _dt.datetime.now()).days
+    days_str = f"还有 {days} 天" if days >= 0 else f"已过 {abs(days)} 天"
+    return f"已添加倒计时喵~ [{date_str}] {event} ({days_str})"
+
+
+
+# --- 排行榜处理 ---
+
+# 榜单周期缓存：board_id -> (periods_list, fetched_at)（10 分钟有效）
+_LB_PERIOD_CACHE: dict = {}
+_LB_PERIOD_TTL = 600
+
+
+async def _align_board_period(board_id: str, want: str) -> str:
+    """按榜单真实支持的 periods 对齐周期，避免撞 API 400。
+    例: arena-modern-global-elo 只有 ALLTIME，想查 WEEKLY 时降级为 ALLTIME。"""
+    global _LB_PERIOD_CACHE
+    now = time.time()
+    cached = _LB_PERIOD_CACHE.get(board_id)
+    if cached and now - cached[1] < _LB_PERIOD_TTL:
+        periods = cached[0]
+    else:
+        from services import wdsj_api as api
+        boards = await api.query_leaderboards()
+        if boards:
+            periods = next((b.get("periods", []) for b in boards if b.get("id") == board_id), [])
+            if not periods:
+                periods = ["ALLTIME", "MONTHLY", "WEEKLY", "DAILY", "SEASON"]
+            _LB_PERIOD_CACHE[board_id] = (periods, now)
+        else:
+            return want  # 列表拿不到就按用户原意走（反正 400 会回来）
+    if want in periods:
+        return want
+    # 降级顺序: ALLTIME > SEASON > MONTHLY > WEEKLY > DAILY
+    for cand in ("ALLTIME", "SEASON", "MONTHLY", "WEEKLY", "DAILY"):
+        if cand in periods:
+            return cand
+    return want
+
+
+async def _handle_wdsj_dual(args, is_group, group_id, user_id):
+    """双模式横屏战绩卡: /~wdsj dual <玩家名> — 起床战争 + 竞技场 一图双段"""
+    import re as _re
+    from services import wdsj_api as api
+    from services.sender import send_group_msg, send_private_msg
+    from pathlib import Path as _P
+
+    # 玩家名（忽略 img 之类后缀，支持绑定回退）
+    parts = [a for a in args if a.lower() not in ("img", "pic", "card", "图片")]
+    player = " ".join(parts).strip() if parts else (_get_bound_player(user_id) or "")
+    if not player:
+        return ("用法: /~wdsj me（用绑定玩家）或 /~wdsj <玩家名> me\n"
+                "未绑定玩家名时可用 /~wdsj bd <玩家名> 绑定喵~")
+    # 误把模式名当玩家名（如 /~wdsj bw me）→ 提示正确用法
+    if parts and len(parts) == 1 and api.resolve_template(parts[0]):
+        return (f"「{player}」是模式名不是玩家名喵~\n"
+                f"查双模式卡: /~wdsj me 或 /~wdsj <玩家名> me\n"
+                f"查单模式: /~wdsj {parts[0]} <玩家名>")
+
+    await (send_group_msg(f"正在生成 {player} 的双模式战绩卡喵~", group_id) if is_group
+           else send_private_msg(f"正在生成 {player} 的双模式战绩卡喵~", user_id))
+
+    # 三项并行：两个模式查询 + 皮肤头像下载（头像内联后渲染不再等外部网络）
+    bw, ar, head_uri = await asyncio.gather(
+        api.query_player_stats(player, "bedwars-stats"),
+        api.query_player_stats(player, "arena-stats"),
+        api.fetch_player_head_data_uri(player),
+        return_exceptions=False,
+    )
+    if not bw and not ar:
+        return format_lang("wdsj.player_not_found", player=player, template="双模式")
+
+    html = api.build_dual_card_html(bw, ar, head_data_uri=head_uri)
+
+    # 卡片宽 1740，需大视口 + 元素截图
+    ts = __import__("datetime").datetime.now().strftime("%Y%m%d_%H%M%S")
+    safe = _re.sub(r"[^\w.\-]", "_", player)[:24]
+    out = str(_P(__file__).resolve().parent.parent / "data" / "img_temp" / f"wdsj_dual_{safe}_{ts}.jpg")
+    try:
+        from modules.changelog import _ensure_browser
+        browser = await _ensure_browser()
+        page = await browser.new_page(viewport={"width": 2400, "height": 1400})  # 卡片宽 2200，视口须 >= 卡片宽
+        await page.set_content(html)
+        await page.wait_for_load_state("domcontentloaded")   # 头像已内联，无需等网络
+        await page.wait_for_timeout(350)
+        el = await page.query_selector(".card")
+        if el:
+            await el.screenshot(path=out, type="jpeg", quality=95)
+        else:
+            await page.screenshot(path=out, full_page=True, type="jpeg", quality=95)
+        await page.close()
+    except Exception as e:
+        logger.warning("wdsj dual 卡片渲染失败: %s", e)
+        return f"双模式战绩卡渲染失败: {e}"
+
+    cq = f"[CQ:image,file=file:///{out.replace(chr(92), '/')}]"
+    await (send_group_msg(cq, group_id) if is_group else send_private_msg(cq, user_id))
+    return None
+
+
+async def _handle_wdsj_lb(args, is_group, group_id, user_id):
+    import os
+    from services import wdsj_api as api
+    from services.sender import send_group_msg, send_private_msg
+    from core.config import get_config
+
+    if not args or args[0].lower() in ("help",):
+        return "\n".join(["排行榜用法: /~wdsj lb <榜单名> [周期] [img]",
+                          "  双词: bw win, kbw tnt, sw kill ...",
+                          "  周期: alltime/month/week/day  末尾+img=卡片图片"])
+
+    # 先发提示
+    from utils.format_lang import format_lang
+    tip = format_lang("wdsj.lb_searching")
+    await (send_group_msg(tip, group_id) if is_group 
+           else send_private_msg(tip, user_id))
+
+    # 检测 img 模式
+    want_img = args[-1].lower() in ("img", "pic", "card", "图片")
+    lb_args = args[:-1] if want_img else args[:]
+    # 支持双词简写
+    if len(lb_args) >= 2:
+        bid = api.resolve_board_shorthand(lb_args[0], lb_args[1])
+        if bid:
+            board_id = bid
+            period = (lb_args[2] if len(lb_args) > 2 else "ALLTIME").upper()
+        else:
+            board_id = api.resolve_board(lb_args[0])
+            period = (lb_args[1] if len(lb_args) > 1 else "ALLTIME").upper()
+    elif lb_args:
+        board_id = api.resolve_board(lb_args[0])
+        period = "ALLTIME"
+    else:
+        return "用法: /~wdsj lb <榜单名> [周期] [img]"
+    board_id = board_id or lb_args[0]
+    period = period if period in api.PERIOD_LABELS else {
+        "MONTH": "MONTHLY", "WEEK": "WEEKLY", "DAY": "DAILY", "ALL": "ALLTIME"
+    }.get(period, "ALLTIME")
+
+    # ★ 周期智能对齐（榜单只支持部分周期时降级，避免 400）
+    period = await _align_board_period(board_id, period)
+
+    data = await api.query_leaderboard(board_id, period)
+    if not data:
+        return format_lang("wdsj.lb_fail", board=board_id)
+
+    # 图片模式
+    if want_img:
+        cfg = get_config()
+        from pathlib import Path as _Path
+
+        ts = __import__("datetime").datetime.now().strftime("%Y%m%d_%H%M%S")
+        fname = f"wdsj_lb_{board_id.replace(chr(47),'_')}_{ts}.png"
+        out = str(_Path(__file__).resolve().parent.parent / "data" / "img_temp" / fname)
+
+        # ★ v2.3.26: 优先 Pillow 直绘（1:1 复刻同模板）。测试项 pillow_card 控制，
+        #   失败/关闭时回退下面的 Chromium 分支。纯 CPU 调用要丢线程池。
+        try:
+            from modules.features import is_enabled as _feat_on
+            if _feat_on("pillow_card"):
+                from services.leaderboard_card import save_leaderboard_card
+                _loop = asyncio.get_running_loop()
+                await _loop.run_in_executor(
+                    None, lambda: save_leaderboard_card(data, out, cfg.bot_name))
+                cq = f"[CQ:image,file=file:///{out.replace(chr(92), '/')}]"
+                await (send_group_msg(cq, group_id) if is_group
+                       else send_private_msg(cq, user_id))
+                logger.info("排行榜卡用 Pillow 绘制完成: %s", _Path(out).name)
+                return None
+        except Exception as _e:
+            logger.warning("排行榜卡 Pillow 绘制失败 → 回退 Chromium: %s", _e)
+
+        html = api.build_leaderboard_html(data, cfg.bot_name)
+        from modules.changelog import _ensure_browser
+        try:
+            browser = await _ensure_browser()
+            page = await browser.new_page(viewport={"width": 440, "height": 600})
+            await page.set_content(html)
+            # ★ v2.3.23: 排行榜卡 head 用外链头像，networkidle 必要时限 1.5s 兜底，
+            #   避免网络抖动时无限空等（DOM 就绪即开始倒计时截图）
+            try:
+                await page.wait_for_load_state("domcontentloaded", timeout=3000)
+            except Exception:
+                pass
+            await page.wait_for_timeout(400)
+            await page.screenshot(path=out, full_page=True)
+            await page.close()
+            cq = f"[CQ:image,file=file:///{out.replace(chr(92), '/')}]"
+            await (send_group_msg(cq, group_id) if is_group else send_private_msg(cq, user_id))
+            return None
+        except Exception as e:
+            return f"排行榜卡片渲染失败: {e}"
+
+    # 文字模式
+    board = data["board"]
+    entries = data.get("entries", [])
+    period_label = api.PERIOD_LABELS.get(data.get("type", "ALLTIME"), "总榜")
+    lines = [f'{board.get("group","")} {board.get("displayName", board_id)} ({period_label})', ""]
+    for e in entries:
+        lines.append(f'  #{e["rank"]:>3}  {e["owner"]:<16} {e["value"]} {board.get("unit","")}')
+    if not entries:
+        lines.append("  (暂无数据)")
+    return "\n".join(lines)
+
+
+# ─── 洛花星雨战绩查询 ────────────────────────────────────────
+
+_WDSJ_PLAYER_FILE = Path(__file__).resolve().parent.parent / "data" / "wdsj_player_name.json"
+
+
+def _load_wdsj_bindings() -> dict:
+    if _WDSJ_PLAYER_FILE.exists():
+        try:
+            return json.loads(_WDSJ_PLAYER_FILE.read_text(encoding="utf-8"))
+        except Exception:
+            pass
+    return {}
+
+
+def _save_wdsj_bindings(data: dict):
+    _WDSJ_PLAYER_FILE.parent.mkdir(parents=True, exist_ok=True)
+    _WDSJ_PLAYER_FILE.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def _get_bound_player(user_id: int) -> str | None:
+    bindings = _load_wdsj_bindings()
+    return bindings.get(str(user_id))
+
+
+async def _handle_wdsj_bind(args: list, user_id: int) -> str:
+    if not args:
+        player = _get_bound_player(user_id)
+        if player:
+            return f"你当前绑定的玩家名是「{player}」喵~"
+        return "你还没有绑定玩家名喵~ 试试 /~wdsj bd <玩家名>"
+    player = args[0]
+    bindings = _load_wdsj_bindings()
+    bindings[str(user_id)] = player
+    _save_wdsj_bindings(bindings)
+    return f"已绑定玩家名「{player}」喵~ 以后查战绩可以直接 /~wdsj bw 不带名字啦"
+
+
+# ─── 洛花星雨战绩查询 ──────────────────────────────────────
+
+def _build_wdsj_summary(data: dict) -> str:
+    """从 WDSJ API 返回中提取简短摘要"""
+    pi = data.get("player", {})
+    display = data.get("_template_display", "未知模式")
+    hdr = data.get("headerCards", [])
+    lines = [f"{pi.get('name', '?')} 的 {display} 战绩"]
+    for c in hdr[:6]:
+        v = c["value"]
+        if c.get("hint"):
+            v = f"{v} ({c['hint']})"
+        lines.append(f"  {c['label']}: {v}")
+    return "\n".join(lines)
+
+
+async def cmd_wdsj(args, user_id, group_id, sender_name, is_group, bot_qq):
+    """
+    洛花星雨战绩查询 /~wdsj <模板> <玩家名> — v2.3.20 起默认发官方图片，text 结尾要文字版
+    别名: bw=起床战争 kbw=击退战场 sw=空岛战争 kp=职业战争 ...
+    """
+    from services import wdsj_api as api
+    from services.sender import send_group_msg, send_private_msg
+
+    if not args or args[0].lower() == "help":
+        # 渲染 MD 帮助卡片图片
+        try:
+            md_path = str(Path(__file__).resolve().parent.parent / "data" / "wdsj_help.md")
+            cfg = get_config()
+            html = api.build_help_card_html(md_path, cfg.bot_name)
+            from modules.changelog import _ensure_browser
+            browser = await _ensure_browser()
+            page = await browser.new_page(viewport={"width": 520, "height": 100})
+            await page.set_content(html)
+            await page.wait_for_timeout(500)
+            await page.set_viewport_size({"width": 520, "height": 100})
+            out = str(Path(__file__).resolve().parent.parent / "data" / "img_temp" / f"wdsj_help_{int(time.time())}.png")
+            await page.screenshot(path=out, full_page=True)
+            await page.close()
+            cq = f"[CQ:image,file=file:///{out.replace(chr(92), '/')}]"
+            await (send_group_msg(cq, group_id) if is_group else send_private_msg(cq, user_id))
+            return None
+        except Exception as e:
+            logger.warning("wdsj help 卡片渲染失败: %s", e)
+            return "\n".join([
+                "洛花星雨战绩查询 /~wdsj",
+                "  <模式> <玩家>            战绩(默认发图片)",
+                "  <模式> <玩家> text       战绩(文字版)",
+                "  lb <榜> [周期] [img]     排行榜",
+                "  me / <玩家名> me         双模式横屏卡(起床+竞技场)",
+                "  boards                   简写速查",
+                "  list                     模式别名",
+                "简写: bw/kbw/sw/kp 周期: all/month/week/day"
+            ])
+
+    action = args[0].lower()
+
+    # ★ 手动采集（仅 admin）
+    if action == "collect":
+        from core.config import get_config as _get_cfg
+        if not _get_cfg().is_admin(user_id, group_id):
+            return "只有管理员才能手动采集喵~"
+        from services.sender import send_group_msg as _sgm
+        await _sgm("⏳ 手动采集开始，请稍候...", group_id)
+        from services.wdsj_tracker import daily_stats_collect
+        import time as _t
+        t0 = _t.time()
+        failed = await daily_stats_collect()  # v2.0.4s: 返回 3 轮重试后仍失败名单
+        elapsed = _t.time() - t0
+        if failed:
+            names = sorted({p for p, _t in failed})
+            return f"✅ 手动采集完成 ({elapsed:.1f}s)，{len(names)} 人仍未采集到: " + "、".join(names)
+        return f"✅ 手动采集完成 ({elapsed:.1f}s)，全部成功"
+
+    # 绑定玩家名
+    if action in ("bd", "bind", "绑定"):
+        if args[1:] and args[1] in ("list", "列表"):
+            bindings = _load_wdsj_bindings()
+            if not bindings:
+                return "还没有人绑定喵~"
+            lines = ["绑定玩家列表:"]
+            seen = set()
+            for qq, name in sorted(bindings.items(), key=lambda x: x[1].lower()):
+                if name not in seen:
+                    seen.add(name)
+                    lines.append(f"  {name}")
+            return "\n".join(lines)
+        return await _handle_wdsj_bind(args[1:], user_id)
+
+    # 排行榜分支
+    if action in ("lb", "排行榜", "ldb"):
+        return await _handle_wdsj_lb(args[1:], is_group, group_id, user_id)
+
+    if action in ("boards", "榜单", "榜"):
+        lines = ["洛花星雨排行榜 简写速查 (用法: /~wdsj lb <简写> [周期] [img])"]
+        lines.append("")
+        # 按游戏分组的简写
+        groups = {
+            "起床战争(bw)": [("win","胜"),("kill","击杀"),("beds","摧床"),("fk","最终"),("1k","首杀")],
+            "击退战场(kbw)": [("kill","击杀"),("dead","死亡"),("tnt","TNT"),("arrow","弓箭"),("rod","鱼竿"),("jp","跳板")],
+            "空岛战争(sw)": [("kill","击杀"),("win","胜"),("dead","死亡"),("1k","首杀")],
+            "职业战争(kp)": [("kill","击杀"),("xp","经验")],
+            "其他": [("pt","在线"),("cp","情侣"),("title","称号"),("guild","公会"),("dg win","画猜"),("cw win","色盲"),("cw kill","色盲杀"),("has win","躲猫猫")],
+        }
+        for group, items in groups.items():
+            suffix = " " + group
+            parts = []
+            for short, name in items:
+                parts.append(f"{short}={name}")
+            lines.append(f"{suffix}: {', '.join(parts)}")
+        return "\n".join(lines)
+
+    if action == "list":
+        lines = ["洛花星雨 13种游戏模式 (简写 => 全名)"]
+        for tid, name in api.TEMPLATES.items():
+            alias = [a for a, t in api.ALIASES.items() if t == tid]
+            a_str = alias[0] if alias else tid
+            lines.append(f"  {a_str} = {tid} ({name})")
+        lines.append("")
+        lines.append("排行榜别名: /~wdsj lb <简写> [周期]")
+        lines.append("  双词: 游戏名 指标 (如: bw win, kbw tnt, sw kill)")
+        for a, bid in sorted(api.BOARD_ALIASES.items()):
+            lines.append(f"  {a:6s} = {bid}")
+        return "\n".join(lines)
+
+    # ★ 群内排名
+    if action in ("rank", "排名", "群排名"):
+        mode_key = (args[1] if len(args) > 1 else "bw_kills").strip().lower()
+        from services.wdsj_tracker import build_group_rank
+        tip = f"正在生成绑定排行 ({mode_key}) 喵..."
+        await (send_group_msg(tip, group_id) if is_group
+               else send_private_msg(tip, user_id))
+        text_result, image_path = await build_group_rank(group_id, mode_key)
+        if image_path:
+            cq = f"[CQ:image,file=file:///{image_path.replace(chr(92), '/')}]"
+            await (send_group_msg(cq, group_id) if is_group
+                   else send_private_msg(cq, user_id))
+            return None
+        return text_result
+
+    # ★ 今日击杀排名（图片渲染）
+    # ★ 日榜 (默认起床，/wdsj daily are = 竞技场)
+    if action in ("daily", "今日", "今天"):
+        from services.wdsj_tracker import build_daily_rankings, build_arena_daily_rankings
+        from datetime import datetime, date as _date
+        import re
+
+        mode = "bw"
+        label_date = None
+        for a in args[1:]:
+            a_lower = a.lower().strip()
+            if a_lower in ("are", "arena", "竞技", "竞技场"):
+                mode = "are"
+            elif re.match(r'^\d{1,2}[-/]\d{1,2}$', a):  # 7-20 or 07/20
+                m = re.match(r'^(\d{1,2})[/-](\d{1,2})$', a)
+                label_date = f"{datetime.now().year}-{int(m.group(1)):02d}-{int(m.group(2)):02d}"
+            elif re.match(r'^\d{4}-\d{2}-\d{2}$', a):  # 2026-07-20
+                label_date = a
+            elif re.match(r'^\d{4}$', a):  # 0720
+                label_date = f"{datetime.now().year}-{int(a[:2]):02d}-{int(a[2:]):02d}"
+
+        if mode == "are":
+            # ★ v2.3.24: 日榜渲染 ~1-3s，先回执避免用户以为没反应（原来全程静默）
+            _is_push0 = len(args) >= 2 and args[-1].lower() in ("send", "push", "推送", "发送")
+            if not _is_push0:
+                await (send_group_msg("正在生成竞技场日榜喵~", group_id) if is_group
+                       else send_private_msg("正在生成竞技场日榜喵~", user_id))
+            rows, today, time_start, time_end, fb = build_arena_daily_rankings(label_date=label_date)
+        else:
+            from datetime import date as _date, timedelta as _td
+            # ★ push 模式强制用跨天（昨天 0:01 → 今天 0:01）
+            is_push = len(args) >= 2 and args[-1].lower() in ("send", "push", "推送", "发送")
+            if is_push and not label_date:
+                label_date = (_date.today() - _td(days=1)).isoformat()
+            # ★ 查询过去日期时自动用跨天模式
+            use_cross = label_date and label_date != _date.today().isoformat()
+            # ★ v2.3.24: 先回执（push 模式是后台推送，不用回执）
+            if not is_push:
+                _d = label_date or _date.today().isoformat()
+                await (send_group_msg(f"正在生成 {_d} 的起床战争日榜喵~", group_id) if is_group
+                       else send_private_msg(f"正在生成 {_d} 的起床战争日榜喵~", user_id))
+            rows, today, time_start, time_end, new_players, fb = build_daily_rankings(
+                label_date=label_date, cross_day=use_cross)
+
+            if not rows:
+                now = datetime.now()
+                label = today or "该日期"
+                if today == _date.today().isoformat():
+                    next_hour = (now.hour // 4 + 1) * 4
+                    if next_hour >= 24:
+                        next_hour = 0
+                    next_time = f"{next_hour:02d}:01"
+                    hint = f"，下一轮 {next_time}"
+                else:
+                    hint = ""
+                return f"{label}还没有数据喵~ 榜单将在每天 0:01 / 4:01 / 8:01 / 12:01 / 16:01 / 20:01 产出{hint}"
+
+        out_path = None
+        # ★ v2.3.26: 起床战争日榜优先走 Pillow 绘制（服务器实测 79ms vs Chromium
+        #   872ms，快 11 倍；一比一复刻，平均像素差 2.5%）。由测试项 pillow_card
+        #   控制，可在 /~key 一键回退；任何异常都自动回退 Chromium，不影响可用性。
+        #   注意：Pillow 是纯 CPU 同步调用，必须丢线程池，否则阻塞事件循环。
+        try:
+            from modules.features import is_enabled as _feat_on
+            _use_pillow = _feat_on("pillow_card")   # 起床/竞技都走 Pillow
+        except Exception:
+            _use_pillow = False
+        if _use_pillow:
+            try:
+                # 起床战争与竞技场是两套模板（暖橙 / 冷蓝）→ 两个渲染入口
+                if mode == "are":
+                    from services.wdsj_card_pillow import save_arena_daily_card as _saver
+                    _payload = _arena_daily_payload(rows, today, time_start, time_end)
+                    _prefix = "wdsj_arena"
+                else:
+                    from services.wdsj_card_pillow import save_daily_rank_card as _saver
+                    _payload = _daily_rank_payload(rows, today, new_players,
+                                                   time_start, time_end)
+                    _prefix = "wdsj_daily"
+                _ts = time.strftime("%Y%m%d_%H%M%S")
+                _out = str(Path(__file__).resolve().parent.parent
+                           / "data" / "img_temp" / f"{_prefix}_{_ts}.jpg")
+                _loop = asyncio.get_running_loop()
+                await _loop.run_in_executor(None, lambda: _saver(_payload, _out))
+                out_path = _out
+                logger.info("日榜卡用 Pillow 绘制完成: %s", Path(_out).name)
+            except Exception as _e:
+                logger.warning("Pillow 日榜卡绘制失败 → 回退 Chromium: %s", _e)
+                out_path = None
+
+        if not out_path:
+            if mode == "are":
+                html = _build_arena_daily_html(rows, today, time_start, time_end)
+            else:
+                html = _build_daily_rank_html(rows, today, new_players, time_start, time_end)
+            prefix = "wdsj_arena" if mode == "are" else "wdsj_daily"
+            out_path = await _render_html_to_png(html, prefix)
+
+        if not out_path:
+            return "排名卡片渲染失败喵~"
+        cq = f"[CQ:image,file=file:///{out_path.replace(chr(92), chr(47))}]"
+
+        # ★ 推送模式：发到当前群（仅 is_group 时）
+        if len(args) >= 2 and args[-1].lower() in ("send", "push", "推送", "发送"):
+            if not is_group:
+                return "send 模式仅在群聊中可用喵~"
+            await send_group_msg(cq, group_id)
+            return None
+
+        await (send_group_msg(cq, group_id) if is_group else send_private_msg(cq, user_id))
+        return None
+
+    # ★ 双模式横屏卡（起床战争 + 竞技场）
+    #    主用法: /~wdsj me（用绑定玩家） | /~wdsj <玩家名> me（指定玩家）
+    #    兼容旧写法: /~wdsj dual <玩家名>
+    _ME_WORDS = ("me", "我", "我的", "my")
+    if action in ("dual", "double", "双模式", "双段") or args[-1].lower() in _ME_WORDS:
+        if action in ("dual", "double", "双模式", "双段"):
+            name_args = args[1:]
+        else:
+            name_args = args[:-1]
+        return await _handle_wdsj_dual(name_args, is_group, group_id, user_id)
+
+    # ★ 折线图
+    if action in ("trend", "趋势", "走势", "折线"):
+        from services.wdsj_tracker import generate_trend_chart
+        player = None
+        metric = "bw_kills"
+        for a in args[1:]:
+            a_lower = a.lower().strip()
+            if a_lower in ("bw_kills", "bw_wins", "bw_finals", "bw_deaths", "arena_kills"):
+                metric = a_lower
+            else:
+                player = a
+        if not player:
+            player = _get_bound_player(user_id)
+        if not player:
+            return "用法: /~wdsj trend <玩家名> [指标]\n未绑定玩家名时试试 /~wdsj bd <玩家名> 先绑定喵~"
+        
+        label = {"bw_kills":"击杀","bw_wins":"胜场","bw_finals":"最终击杀","bw_deaths":"死亡","arena_kills":"竞技场击杀"}.get(metric, metric)
+        tip = f"正在生成 {player} 的 {label} 趋势图喵..."
+        await (send_group_msg(tip, group_id) if is_group
+               else send_private_msg(tip, user_id))
+        
+        img = generate_trend_chart(player, metric)
+        if img:
+            cq = f"[CQ:image,file=file:///{img.replace(chr(92), '/')}]"
+            await (send_group_msg(cq, group_id) if is_group
+                   else send_private_msg(cq, user_id))
+            return None
+        return f"{player} 的 {label} 数据不够喵~ 需要至少 2 天的记录才能画趋势图"
+
+    if len(args) < 2:
+        # 尝试从绑定中查找
+        player = _get_bound_player(user_id)
+        if player:
+            args = [args[0], player] + (args[1:] if len(args) > 1 else [])
+        if len(args) < 2:
+            return "用法: /~wdsj <模式> <玩家名>\n未绑定玩家名时可用 /~wdsj bd <玩家名> 绑定喵~"
+
+    # 提取输出模式标记（在绑定补齐之后）
+    # v2.3.20: 默认发官方图片卡片（去文字刷屏）；img/pic/card/图片 兼容旧写法（等同默认）；
+    # text/文字/notext 显式要文字版
+    _last = args[-1].lower()
+    if _last in ("img", "pic", "card", "图片", "text", "文字", "notext", "文本"):
+        want_img = _last not in ("text", "文字", "notext", "文本")
+        player_parts = args[1:-1]
+    else:
+        want_img = True
+        player_parts = args[1:]
+    # 如果只有模板+img，没有玩家名，尝试绑定
+    if not player_parts or all(p in ("img", "pic", "card", "图片") for p in player_parts):
+        player = _get_bound_player(user_id)
+        if player:
+            player_parts = [player]
+    player = " ".join(player_parts)
+    if not player:
+        return "用法: /~wdsj <模式> <玩家名>\n未绑定玩家名时可用 /~wdsj bd <玩家名> 绑定喵~"
+
+    template_id = api.resolve_template(action)
+    if not template_id:
+        return f"未知模式: {action}\n用 /~wdsj list 查看所有模式"
+
+    display = api.TEMPLATES.get(template_id, template_id)
+    logger.info("查询wdsj战绩: player=%s template=%s img=%s", player, template_id, want_img)
+
+    from utils.format_lang import format_lang
+
+    tip = format_lang("wdsj.player_searching", player=player, template=display)
+    await (send_group_msg(tip, group_id) if is_group
+           else send_private_msg(tip, user_id))
+
+    data = await api.query_player_stats(player, template_id)
+    if not data:
+        return format_lang("wdsj.player_not_found", player=player, template=display)
+
+    # 图片模式：下载官方 PNG
+    if want_img:
+        snapshot = data.get("snapshotKey", "")
+        if not snapshot:
+            return "官方图片尚未生成喵~ 用 /~wdsj {} {} text 看文字数据".format(action, player)
+        image_url = f"/api/v1/images/{snapshot}"
+
+        # 下载到项目 img_temp 目录（NapCat 可访问）
+        from pathlib import Path as _Path
+        out_dir = _Path(__file__).resolve().parent.parent / "data" / "img_temp"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        save_path = str(out_dir / f"wdsj_{snapshot}.png")
+
+        ok = await api.download_stats_image(image_url, save_path)
+        if ok:
+            cq = f"[CQ:image,file=file:///{save_path.replace(chr(92), '/')}]"
+            await (send_group_msg(cq, group_id) if is_group else send_private_msg(cq, user_id))
+            # ★ 缓存数据：引用此图时直接返回文字数据，不调视觉模型
+            from services.wdsj_cache import store as wdsj_store
+            data["_template_display"] = display
+            summary = _build_wdsj_summary(data)
+            wdsj_store(snapshot, player, template_id, summary)
+            return None
+        else:
+            return format_lang("wdsj.img_download_fail") + " 用 text 看文字数据喵~"
+
+    # 文字模式：完整数据
+    pi = data.get("player", {})
+    vals = data.get("values", {})
+    labels = data.get("labels", {})
+    hdr = data.get("headerCards", [])
+    smr = data.get("summaryCards", [])
+
+    lines = [f"{pi.get('name', '?')} 的 {display} 战绩"]
+
+    for c in hdr:
+        v = c["value"]
+        if c.get("hint"): v = f"{v} ({c['hint']})"
+        lines.append(f"  {c['label']}: {v}")
+
+    if smr:
+        lines.append("")
+        for c in smr:
+            lines.append(f"  {c['label']}: {c['value']}")
+
+    if vals:
+        lines.append("")
+        for k, v in vals.items():
+            label = labels.get(k, k)
+            lines.append(f"  {label}: {v}")
+
+        return "\n".join(lines)
+
+# ─── /~owner 卡片渲染 ───────────────────────────────────
+
+def _build_owner_help_md() -> str:
+    return (
+        "**/~owner** — 配置管理（仅主人可用）\n\n"
+        "---\n\n"
+        "### 配置文件\n"
+        "| 指令 | 说明 |\n"
+        "|------|------|\n"
+        "| `/~owner list <域>` | 列出配置：`bot` / `adapter` / `roles` |\n"
+        "| `/~owner get <路径>` | 读取：`get bot.reply_threshold` |\n"
+        "| `/~owner set <路径> <值>` | 设置：`set bot.reply_threshold 5` |\n"
+        "\n"
+        "### 数据文件\n"
+        "| 指令 | 说明 |\n"
+        "|------|------|\n"
+        "| `/~owner data get <名> [键]` | 读取：`data get fav` 或 `data get fav g_123_456` |\n"
+        "| `/~owner data set <名> <键> <值>` | 设置：`data set fav g_123_456 100` |\n"
+        "| `/~owner data del <名> <键>` | 删除某条记录 |\n"
+        "| `/~owner data reset <名\\|all>` | 重置：`data reset fav` / `data reset all` |\n"
+        "| 可用数据：`fav` `luck` `countdown` `reminders` `recall` `wzq` |\n"
+        "\n"
+        "### 快捷白名单\n"
+        "| 指令 | 说明 |\n"
+        "|------|------|\n"
+        "| `/~owner wl add group <群号>` | 添加群白名单 |\n"
+        "| `/~owner wl add private <QQ>` | 添加私聊白名单 |\n"
+        "| `/~owner wl remove group <群号>` | 移除群白名单 |\n"
+        "| `/~owner wl remove private <QQ>` | 移除私聊白名单 |\n"
+        "| `/~owner wl show` | 查看白名单 |\n"
+        "| `/~owner wl welcome set <群> <语>` | 设置入群欢迎语 |\n"
+        "| `/~owner wl welcome del <群>` | 删除入群欢迎语 |\n"
+        "\n"
+        "### 运气管理\n"
+        "| 指令 | 说明 |\n"
+        "|------|------|\n"
+        "| `/~owner luck list` | 查看今日全员运气值 |\n"
+        "| `/~owner luck set <QQ> <0~100>` | 修改某人的运气值 |\n"
+        "| `/~owner luck del <QQ>` | 删除某人的运气记录 |\n"
+        "\n"
+        "### 画图 / 视频配额\n"
+        "| 指令 | 说明 |\n"
+        "|------|------|\n"
+        "| `/~owner draw get [QQ]` | 查看画图用量，不填 QQ 看全部 |\n"
+        "| `/~owner draw set <QQ> <N>` | 设每日画图上限（默认 5）|\n"
+        "| `/~owner draw reset` | 重置今日画图用量 |\n"
+        "| `/~owner video get\\|set\\|reset` | 视频配额管理（默认 4）|\n"
+        "\n"
+        "### 指令白名单\n"
+        "| 指令 | 说明 |\n"
+        "|------|------|\n"
+        "| `/~owner cmd add <指令>` | 添加：`cmd add weather` |\n"
+        "| `/~owner cmd remove <指令>` | 移除 |\n"
+        "| `/~owner cmd list` | 查看白名单指令 |\n"
+        "| `/~owner cmd clear` | 清空白名单（所有指令仅主人可用）|\n"
+    )
+
+
+def _build_owner_help_html(md: str) -> str:
+    return f"""<!DOCTYPE html><html lang="zh-CN"><head><meta charset="UTF-8">
+<style>
+*{{margin:0;padding:0;box-sizing:border-box}}
+body{{background:#1a1a2e;color:#e0e0e0;font-family:"Microsoft YaHei","PingFang SC",sans-serif;padding:28px;width:680px}}
+.header{{background:linear-gradient(135deg,#f97316,#dc2626);color:#fff;border-radius:12px;padding:20px 24px;margin-bottom:20px}}
+.header h1{{font-size:22px;margin-bottom:4px}}
+.header .sub{{font-size:13px;opacity:.85}}
+.section{{margin-bottom:18px}}
+.section h3{{font-size:15px;color:#fb923c;border-left:3px solid #f97316;padding-left:10px;margin-bottom:8px}}
+table{{width:100%;border-collapse:collapse;font-size:13px}}
+th{{background:rgba(249,115,22,.15);color:#fb923c;text-align:left;padding:6px 10px;font-weight:600}}
+td{{padding:5px 10px;border-bottom:1px solid rgba(255,255,255,.06)}}
+code{{background:rgba(249,115,22,.12);color:#fb923c;padding:1px 6px;border-radius:4px;font-size:12px}}
+tr:hover td{{background:rgba(249,115,22,.06)}}
+.footer{{text-align:center;font-size:11px;color:#666;margin-top:16px;padding-top:12px;border-top:1px solid rgba(255,255,255,.08)}}
+</style></head><body>
+<div class="header"><h1>🤖 配置管理 /~owner</h1><div class="sub">仅主人可用 | 幻梦 QQ Bot</div></div>
+<div class="section"><h3>⚙️ 配置文件</h3><table><tr><th>指令</th><th>说明</th></tr>
+<tr><td><code>/~owner list &lt;域&gt;</code></td><td>列出配置：<code>bot</code> / <code>adapter</code> / <code>roles</code></td></tr>
+<tr><td><code>/~owner get &lt;路径&gt;</code></td><td>读取配置值，如 <code>get bot.reply_threshold</code></td></tr>
+<tr><td><code>/~owner set &lt;路径&gt; &lt;值&gt;</code></td><td>设置配置值，如 <code>set bot.reply_threshold 5</code></td></tr>
+</table></div>
+<div class="section"><h3>📂 数据文件</h3><table><tr><th>指令</th><th>说明</th></tr>
+<tr><td><code>/~owner data get &lt;名&gt; [键]</code></td><td>读取数据文件</td></tr>
+<tr><td><code>/~owner data set &lt;名&gt; &lt;键&gt; &lt;值&gt;</code></td><td>设置数据</td></tr>
+<tr><td><code>/~owner data del &lt;名&gt; &lt;键&gt;</code></td><td>删除记录</td></tr>
+<tr><td><code>/~owner data reset &lt;名|all&gt;</code></td><td>重置数据文件</td></tr>
+<tr><td colspan="2">可用数据：<code>fav</code> <code>luck</code> <code>countdown</code> <code>reminders</code> <code>recall</code> <code>wzq</code></td></tr>
+</table></div>
+<div class="section"><h3>🛡️ 快捷白名单</h3><table><tr><th>指令</th><th>说明</th></tr>
+<tr><td><code>/~owner wl add group &lt;群号&gt;</code></td><td>添加群白名单</td></tr>
+<tr><td><code>/~owner wl add private &lt;QQ&gt;</code></td><td>添加私聊白名单</td></tr>
+<tr><td><code>/~owner wl remove group &lt;群号&gt;</code></td><td>移除群白名单</td></tr>
+<tr><td><code>/~owner wl remove private &lt;QQ&gt;</code></td><td>移除私聊白名单</td></tr>
+<tr><td><code>/~owner wl show</code></td><td>查看白名单</td></tr>
+<tr><td><code>/~owner wl welcome set &lt;群&gt; &lt;语&gt;</code></td><td>设置入群欢迎语</td></tr>
+<tr><td><code>/~owner wl welcome del &lt;群&gt;</code></td><td>删除入群欢迎语</td></tr>
+</table></div>
+<div class="section"><h3>🍀 运气管理</h3><table><tr><th>指令</th><th>说明</th></tr>
+<tr><td><code>/~owner luck list</code></td><td>查看今日全员运气值</td></tr>
+<tr><td><code>/~owner luck set &lt;QQ&gt; &lt;0~100&gt;</code></td><td>修改运气值</td></tr>
+<tr><td><code>/~owner luck del &lt;QQ&gt;</code></td><td>删除运气记录</td></tr>
+</table></div>
+<div class="section"><h3>🎨 画图 / 视频配额</h3><table><tr><th>指令</th><th>说明</th></tr>
+<tr><td><code>/~owner draw get [QQ]</code></td><td>查看画图用量，不填 QQ 看全部</td></tr>
+<tr><td><code>/~owner draw set &lt;QQ&gt; &lt;N&gt;</code></td><td>设每日画图上限（默认 5）</td></tr>
+<tr><td><code>/~owner draw reset</code></td><td>重置今日画图用量</td></tr>
+<tr><td><code>/~owner video get|set|reset</code></td><td>视频配额管理（默认 4）</td></tr>
+</table></div>
+<div class="section"><h3>🔒 指令白名单</h3><table><tr><th>指令</th><th>说明</th></tr>
+<tr><td><code>/~owner cmd add &lt;指令&gt;</code></td><td>添加指令到白名单</td></tr>
+<tr><td><code>/~owner cmd remove &lt;指令&gt;</code></td><td>从白名单移除</td></tr>
+<tr><td><code>/~owner cmd list</code></td><td>查看白名单指令</td></tr>
+<tr><td><code>/~owner cmd clear</code></td><td>清空（仅主人可用所有指令）</td></tr>
+</table></div>
+<div class="footer">幻梦 QQ Bot | /~owner 配置管理</div>
+</body></html>"""
+
+def _handle_owner_cmd(args):
+    roles = load_roles_config()
+    wl = roles.get("command_whitelist", [])
+    if not isinstance(wl, list): wl = []
+    if not args:
+        return "~owner cmd add/remove/list/clear <指令名>"
+    sub = args[0].lower()
+    if sub in ("list", "show"):
+        if not wl: return "指令白名单为空（所有指令可用）"
+        return "指令白名单:\n  " + "\n  ".join(wl)
+    if sub == "clear":
+        roles["command_whitelist"] = []
+        save_roles_config(roles)
+        return "指令白名单已清空（所有指令可用）"
+    if sub in ("add", "remove") and len(args) < 2:
+        return f"~owner cmd {sub} <指令名>"
+    cmd_name = args[1].lower().lstrip("/~#")
+    if sub == "add":
+        if cmd_name in wl: return f"指令 {cmd_name} 已在白名单"
+        wl.append(cmd_name)
+        roles["command_whitelist"] = wl; save_roles_config(roles)
+        return f"已添加: {cmd_name}"
+    if sub == "remove":
+        if cmd_name not in wl: return f"指令 {cmd_name} 不在白名单"
+        wl.remove(cmd_name)
+        roles["command_whitelist"] = wl; save_roles_config(roles)
+        return f"已移除: {cmd_name}"
+    return f"未知 cmd 子命令: {sub}"
+
+
+# ─── 管理员 ──────────────────────────────────────────────────
+
+async def cmd_owner(args, user_id, group_id, sender_name, is_group, bot_qq):
+    """
+    配置管理 /~owner <action> ...
+    
+    config get/set/list  — 读写配置
+    data get/set/del/reset — 管理数据文件
+    wl add/remove        — 白名单快捷操作
+    """
+    cfg = get_config()
+    if not cfg.is_admin(user_id, group_id):
+        return "权限不足喵~"
+
+    if not args or (len(args) == 1 and args[0].lower() == "help"):
+        md = _build_owner_help_md()
+        from modules.changelog import render_card_to_image
+        from services.sender import send_group_msg, send_private_msg
+        import uuid
+
+        html = _build_owner_help_html(md)
+
+        filename = f"owner_{uuid.uuid4().hex[:8]}.jpg"
+        img_path = await render_card_to_image(html, filename, width=680)
+        if not img_path:
+            return "卡片生成失败喵~"
+
+        normalized = img_path.replace("\\", "/")
+        cq = f"[CQ:image,file=file:///{normalized}]"
+        if is_group:
+            await send_group_msg(cq, group_id)
+        else:
+            await send_private_msg(cq, user_id)
+        return None
+
+    from modules import admin
+
+    action = args[0].lower()
+
+    # ── config list ──
+    if action == "list":
+        section = args[1] if len(args) > 1 else "bot"
+        return admin.config_list(section)
+
+    # ── config get ──
+    if action == "get":
+        if len(args) < 2:
+            return "用法: /~owner get <路径>\n如: get bot.reply_threshold"
+        return admin.config_get(args[1])
+
+    # ── config set ──
+    if action == "set":
+        if len(args) < 3:
+            return "用法: /~owner set <路径> <值>\n如: set bot.reply_threshold 5"
+        return admin.config_set(args[1], " ".join(args[2:]))
+
+    # ── data 子命令 ──
+    if action == "data":
+        if len(args) < 3:
+            return "用法: /~owner data <get|set|del|reset> <名> [键] [值]"
+        sub = args[1].lower()
+        if sub == "get":
+            key = args[3] if len(args) > 3 else ""
+            # ★ fav key 自动纠正
+            if args[2] == "fav" and key and key.isdigit():
+                uid = int(key)
+                key = f"g{group_id}:{uid}" if is_group else f"p:{uid}"
+            return admin.data_get(args[2], key)
+        if sub == "set":
+            if len(args) < 5:
+                return "用法: data set <名> <键> <值>"
+            key = args[3]
+            # ★ fav key 自动纠正
+            if args[2] == "fav" and key.isdigit():
+                uid = int(key)
+                key = f"g{group_id}:{uid}" if is_group else f"p:{uid}"
+                logger.info("fav key 自动纠正: %s → %s", args[3], key)
+            return admin.data_set(args[2], key, " ".join(args[4:]))
+        if sub == "del":
+            key = args[3] if len(args) > 3 else "*"
+            # ★ fav key 自动纠正
+            if args[2] == "fav" and key != "*" and key.isdigit():
+                uid = int(key)
+                key = f"g{group_id}:{uid}" if is_group else f"p:{uid}"
+            return admin.data_delete(args[2], key)
+        if sub == "reset":
+            return admin.data_reset(args[2])
+        return f"未知 data 操作: {sub}"
+
+    # ── luck 子命令 ──
+    if action == "luck":
+        sub = args[1].lower() if len(args) > 1 else "list"
+        if sub == "list":
+            return admin.luck_list()
+        if sub == "set" and len(args) >= 4:
+            return admin.luck_set(args[2], args[3])
+        if sub == "del" and len(args) >= 3:
+            return admin.luck_del(args[2])
+        return "用法: luck list|set <QQ> <值>|del <QQ>"
+
+    # ── files 子命令 ──
+    if action == "files":
+        path = args[1] if len(args) > 1 else "data/update_log.md"
+        return admin.read_project_file(path)
+
+    # ── cmd 子命令（指令白名单）──
+    if action == "cmd":
+        return _handle_owner_cmd(args[1:])
+
+    # ── wl 子命令 ──
+    if action == "wl":
+        if len(args) < 2:
+            return (
+                "【白名单管理 /~owner wl】\n"
+                "  wl add group <群号> [atonly]  添加群白名单\n"
+                "  wl remove group <群号>  移除群白名单\n"
+                "  wl add private <QQ>    添加私聊白名单\n"
+                "  wl remove private <QQ> 移除私聊白名单\n"
+                "  wl show                查看所有白名单\n"
+                "  wl cmd add|remove <群> <指令>  分群指令白名单\n"
+                "  wl welcome set|del <群> [欢迎语]  入群欢迎语"
+            )
+        sub = args[1].lower()
+        if sub == "cmd":
+            return admin.wl_cmd_manage(args[2:])
+        if sub == "welcome":
+            return admin.wl_welcome_manage(args[2:])
+        if sub == "show":
+            return admin.show_whitelists()
+        if sub == "add" and len(args) >= 4:
+            result = admin.whitelist_add(args[2], int(args[3]))
+            if len(args) >= 5 and args[4].lower() == "atonly" and args[2] == "group":
+                admin.group_set(int(args[3]), "at_only", "true")
+                result += "\n已设置 @仅模式"
+            return result
+        if sub == "remove" and len(args) >= 4:
+            return admin.whitelist_remove(args[2], int(args[3]))
+        if sub in ("gset", "set") and len(args) >= 4 and args[2].isdigit():
+            gid = int(args[2])
+            mode = args[3].lower()
+            if mode in ("atonly", "aton", "@仅"):
+                return admin.group_set(gid, "at_only", "true")
+            if mode == "default":
+                return admin.group_set(gid, "at_only", "false")
+            return f"设置: group={gid} mode={mode}\n支持: atonly, default"
+        return "格式: wl add|remove group|private <ID>\n      wl gset <群号> atonly|default\n例: wl add group 123456789 atonly"
+
+    # ── wdsj 推送群管理 ──
+    if action == "wdsj":
+        import toml
+        from pathlib import Path
+        _cfg_path = Path(__file__).resolve().parent.parent / "config" / "bot_config.toml"
+        if len(args) < 2:
+            return "用法: /~owner wdsj groups <show|set|clear>\n  show  查看推送群\n  set 123456789,987654321  设推送群\n  clear  清除(发全群)"
+        sub = args[1].lower()
+        if sub == "show" or sub == "groups":
+            data = toml.load(_cfg_path) if _cfg_path.exists() else {}
+            gs = data.get("wdsj", {}).get("target_groups", [])
+            if gs:
+                return f"WDSJ 日榜推送群: {', '.join(str(g) for g in gs)}"
+            return "未设置推送群，凌晨自动发全群"
+        if sub == "set":
+            if len(args) < 3:
+                return "用法: /~owner wdsj groups set <群号1,群号2,...>"
+            gs = [int(x.strip()) for x in args[2].split(",") if x.strip().isdigit()]
+            data = toml.load(_cfg_path) if _cfg_path.exists() else {}
+            data.setdefault("wdsj", {})["target_groups"] = gs
+            _cfg_path.write_text(toml.dumps(data), encoding="utf-8")
+            cfg.config["wdsj"] = data["wdsj"]  # 热更新内存
+            return f"WDSJ 日榜推送群已设为: {', '.join(str(g) for g in gs)}"
+        if sub == "clear":
+            data = toml.load(_cfg_path) if _cfg_path.exists() else {}
+            data.setdefault("wdsj", {}).pop("target_groups", None)
+            _cfg_path.write_text(toml.dumps(data), encoding="utf-8")
+            cfg.config["wdsj"] = data["wdsj"]
+            return "已清除推送群限制，凌晨发全群"
+        return f"未知: /~owner wdsj {sub}"
+
+    # ── draw/video 配额管理 ──
+    if action in ("draw", "video"):
+        from modules.agnes import owner_quota_get, owner_quota_set, owner_quota_reset
+        if len(args) < 2:
+            return f"用法: /~owner {action} <get|set|reset> [参数]\n/~owner {action} get [QQ]  查看用量\n/~owner {action} set <QQ> <N>  设上限\n/~owner {action} reset       重置"
+        sub = args[1].lower()
+        if sub == "get":
+            qq = args[2] if len(args) > 2 else ""
+            return owner_quota_get(action, qq)
+        if sub == "set":
+            if len(args) < 4:
+                return f"用法: /~owner {action} set <QQ> <N>"
+            owner_quota_set(action, args[2], int(args[3]))
+            return f"已设置 QQ {args[2]} 每日{action}上限为 {args[3]}"
+        if sub == "reset":
+            owner_quota_reset(action)
+            return f"已重置今日{action}用量"
+        return f"未知: /~owner {action} {sub}"
+
+    # ── 兼容旧指令 ──
+    if action in ("glist", "gadd", "gremove", "padd", "premove", "gset"):
+        return await _owner_legacy(args, action, admin)
+
+    return f"未知操作: {action}\n/~owner 查看帮助"
+
+
+# ─── 记忆查询 ────────────────────────────────────────────────
+
+async def cmd_memory(args, user_id, group_id, sender_name, is_group, bot_qq):
+    """
+    三层记忆查询 /~memory [瞬时|短时|长时|搜索 <关键词>]
+    """
+    from modules import stm
+    from modules.memory import read_long_memory, search_long_memory
+
+    chat_id = group_id if is_group else user_id
+
+    if not args:
+        return (
+            "【三层记忆 /~memory】\n"
+            "  working      瞬时记忆（当前对话上下文）\n"
+            "  short        短时记忆（最近30条）\n"
+            "  long         长时记忆（持久化）\n"
+            "  search <关键词>  搜索所有记忆\n"
+            "  clear        清空短时记忆"
+        )
+
+    action = args[0].lower()
+
+    if action == "working":
+        from core.context_manager import get_context
+        ctx = get_context()
+        msgs = ctx.get_history(chat_id, 15)
+        if not msgs:
+            return "瞬时记忆为空"
+        lines = [f"【瞬时记忆 · 最近{len(msgs)}条】"]
+        for m in msgs:
+            lines.append(f"  [{m.get('tag','?')}] {m.get('sender','')}: {m.get('content','')[:80]}")
+        return "\n".join(lines)
+
+    if action in ("short", "stm", "短时"):
+        return stm.summarize(chat_id)
+
+    if action in ("long", "ltm", "长时"):
+        return read_long_memory(chat_id)
+
+    if action == "search":
+        if len(args) < 2:
+            return "用法: /~memory search <关键词>"
+        kw = " ".join(args[1:])
+        s = stm.search(chat_id, kw)
+        l = search_long_memory(chat_id, kw)
+        parts = []
+        if s:
+            parts.append("【短时记忆匹配】")
+            for e in s:
+                t = __import__("time").strftime("%H:%M", __import__("time").localtime(e["time"]))
+                parts.append(f"  [{t}] {e['content'][:100]}")
+        if l:
+            if parts: parts.append("")
+            parts.append("【长时记忆匹配】")
+            parts.append(l)
+        return "\n".join(parts) if parts else f"未找到含「{kw}」的记忆"
+
+    if action == "clear":
+        return stm.clear(chat_id)
+
+    return f"未知操作: {action}\n/~memory 查看帮助"
+
+
+# --- 昵称同步 ---
+
+async def cmd_nickname(args, user_id, group_id, sender_name, is_group, bot_qq):
+    if not args or args[0].lower() != 'update':
+        return '用法: /~nickname update'
+    from modules.nickname_sync import sync_and_report
+    chat_id = group_id if is_group else user_id
+    return await sync_and_report(chat_id=chat_id, is_group=is_group)
+
+
+# --- 好友请求审批 ---
+
+async def cmd_friend_add(args, user_id, group_id, sender_name, is_group, bot_qq):
+    """/#添加 [wl] — 批准好友请求，可选加白名单"""
+    from modules.friend_request import get_latest_pending, approve_request
+
+    req = get_latest_pending()
+    if not req:
+        return "当前没有待处理的好友请求喵~"
+
+    add_wl = args and args[0].lower() == "wl"
+    return await approve_request(req["flag"], add_whitelist=add_wl)
+
+
+async def cmd_friend_reject(args, user_id, group_id, sender_name, is_group, bot_qq):
+    """/#拒绝 — 拒绝好友请求"""
+    from modules.friend_request import get_latest_pending, reject_request
+
+    req = get_latest_pending()
+    if not req:
+        return "当前没有待处理的好友请求喵~"
+
+    return await reject_request(req["flag"])
+
+
+async def cmd_friend_list(args, user_id, group_id, sender_name, is_group, bot_qq):
+    """/#好友列表 — 查看所有待处理好友请求"""
+    from modules.friend_request import list_pending
+    return list_pending()
+
+
+async def _owner_legacy(args, action, admin):
+    """兼容旧版 owner 子命令"""
+    if action == "glist":
+        return admin.show_whitelists()
+    if action == "gadd" and len(args) >= 2 and args[1].isdigit():
+        return admin.whitelist_add("group", int(args[1]))
+    if action == "gremove" and len(args) >= 2 and args[1].isdigit():
+        return admin.whitelist_remove("group", int(args[1]))
+    if action == "padd" and len(args) >= 2 and args[1].isdigit():
+        return admin.whitelist_add("private", int(args[1]))
+    if action == "premove" and len(args) >= 2 and args[1].isdigit():
+        return admin.whitelist_remove("private", int(args[1]))
+    if action == "gset" and len(args) >= 2 and args[1].isdigit():
+        gid = int(args[1])
+        sub = args[2].lower() if len(args) > 2 else ""
+        if not sub or sub == "show":
+            return admin.config_get(f"adapter.group_settings.{gid}")
+        if sub == "reply" and len(args) > 3 and args[3].isdigit():
+            return admin.group_set(gid, "reply_threshold", args[3])
+        if sub == "atonly":
+            return admin.group_set(gid, "at_only", "true")
+        if sub == "default":
+            return admin.config_set(f"adapter.group_settings.{gid}", "null")
+    return f"未知操作: {action}"
+
+async def cmd_restart(args, user_id, group_id, sender_name, is_group, bot_qq):
+    """远程重启 /~restart"""
+    from core.config import get_config
+    cfg = get_config()
+    if not cfg.is_admin(user_id, group_id if is_group else 0):
+        return "权限不足"
+    from services.sender import send_group_msg, send_private_msg
+    if is_group:
+        await send_group_msg("正在重启喵～", group_id)
+    else:
+        await send_private_msg("正在重启喵～", user_id)
+    import os
+    os._exit(0)
+
+
+# ════════════════════════════════════════════════════════════
+#  指令注册表 & 分发器
+# ════════════════════════════════════════════════════════════
+
+async def cmd_sys(args, user_id, group_id, sender_name, is_group, bot_qq):
+    """/~sys [card|shot|shotdesk] — PC 状态/截屏（**仅主人或授权名单**）"""
+    from services.pc_status import build_sys_card_html, format_pc_status, request_screenshot
+    from modules.changelog import render_card_to_image
+    from services.sender import send_group_msg, send_private_msg
+    from core.config import get_config
+    import uuid, base64, tempfile
+
+    # ══════════════════════════════════════════════════════════
+    # ★ 2026-10-04: 补上缺失的身份闸（**安全修复，务必保留**）
+    #
+    # 原实现**没有任何权限校验** —— 任何群友都能：
+    #   · `/~sys`      看到主人的窗口标题、CPU/内存、甚至电池
+    #   · `/~sys shot` **把主人屏幕截图直接发到群里**
+    # 而同日我给 `/~sys shot` 加了"PC 客户端没连上就本机截屏"的回退，
+    # 等于把这个洞从「用不了」变成了「能用」—— 属自己引入的放大效应。
+    #
+    # 这里用与 `/~screen` **完全相同**的规则（主人本人 + data/screen_allow.txt），
+    # 保证"能看屏幕"这件事只有一个入口、一套判定，不会再出现旁路。
+    # ══════════════════════════════════════════════════════════
+    try:
+        _uid = int(user_id)
+    except (TypeError, ValueError):
+        _uid = 0
+    _cfg_gate = get_config()
+    try:
+        _owner = int(getattr(_cfg_gate, "admin_qq", 0) or 0)
+    except (TypeError, ValueError):
+        _owner = 0
+    if not _uid or (_uid != _owner):
+        from modules.screen import allowed_viewers as _allowed_viewers
+        if _uid not in _allowed_viewers():
+            logger.warning("未授权者尝试查看 PC 状态/截屏: user=%s group=%s", user_id, group_id)
+            return "这个只有主人和他授权的人能用喵~"
+
+    sub = (args[0].lower() if args else "")
+    # ★ v2.3.24 通用化: owner 名不再硬编码 "Trusler"，取 roles.toml 的 qq_name_map
+    #   （admin_qq 对应的昵称），换部署改配置即可，不用动代码
+    _cfg = get_config()
+    owner = _cfg.get_display_name(_cfg.admin_qq) or "主人"
+
+    # 截屏
+    if sub in ("shot", "shotdesk"):
+        # ★ v2.3.24: 截屏最长等 30s，先回执避免用户以为没反应（原来全程静默）
+        await (send_group_msg("正在叫 PC 截屏喵，稍等一下下~", group_id) if is_group
+               else send_private_msg("正在叫 PC 截屏喵，稍等一下下~", user_id))
+        b64 = await request_screenshot(timeout=30.0)
+        if not b64:
+            # ★ 2026-10-04: PC 客户端没连上时**回退到本机截屏**。
+            #   那套 TCP 客户端是给「机器人跑服务器、主人电脑是另一台」的场景用的；
+            #   而本部署里幻梦**就跑在主人电脑上**，直接 ImageGrab 即可，
+            #   不必因为这个客户端没开就让整个截屏功能失效。
+            logger.info("[sys shot] PC 客户端未连接，回退本机截屏")
+            from modules.screen import grab_screen, _prepare as _prep_shot
+            import io as _io_shot
+            try:
+                _img = _prep_shot(await __import__("asyncio").get_running_loop().run_in_executor(None, grab_screen))
+            except Exception as e:
+                return f"截屏失败（PC 客户端未连接，本机截屏也失败：{e}）"
+            from pathlib import Path as _P2
+            tmp = _P2(__file__).resolve().parent.parent / "data" / "img_temp" / f"shot_{uuid.uuid4().hex[:8]}.jpg"
+            tmp.parent.mkdir(parents=True, exist_ok=True)
+            _buf = _io_shot.BytesIO()
+            _img.save(_buf, format="JPEG", quality=85)
+            tmp.write_bytes(_buf.getvalue())
+            cq = f"[CQ:image,file=file://{tmp.as_posix()}]"
+            if is_group:
+                await send_group_msg(cq, group_id)
+            else:
+                await send_private_msg(cq, user_id)
+            return None
+        from pathlib import Path as _Path
+        tmp = _Path(__file__).resolve().parent.parent / "data" / "img_temp" / f"shot_{uuid.uuid4().hex[:8]}.jpg"
+        tmp.parent.mkdir(parents=True, exist_ok=True)
+        import binascii
+        try:
+            data = binascii.a2b_base64(b64)
+        except Exception as e:
+            return f"截屏数据解码失败: {e}"
+        tmp.write_bytes(data)
+        cq = f"[CQ:image,file=file://{tmp.as_posix()}]"
+        if is_group:
+            await send_group_msg(cq, group_id)
+        else:
+            await send_private_msg(cq, user_id)
+        return None
+
+    # HTML 卡片
+    if sub == "card":
+        html = build_sys_card_html(owner=owner, bot_name=_cfg.bot_name)
+        if html:
+            filename = f"sys_{uuid.uuid4().hex[:8]}.jpg"
+            img_path = await render_card_to_image(html, filename, width=760)
+            if img_path:
+                normalized = img_path.replace("\\", "/")
+                cq = f"[CQ:image,file=file:///{normalized}]"
+                if is_group:
+                    await send_group_msg(cq, group_id)
+                else:
+                    await send_private_msg(cq, user_id)
+                return None
+        return format_pc_status(owner=owner)
+
+    # 默认：纯文字
+    return format_pc_status(owner=owner)
+
+
+async def cmd_phone(args, user_id, group_id, sender_name, is_group, bot_qq):
+    """/~phone [status] — 手机实时状态（由配套 App 经 TCP 长连接上报）"""
+    from services.phone_status import format_phone_status
+    sub = (args[0].lower() if args else "")
+    # 预留子命令扩展（如 card 卡片），当前仅返回文本
+    return format_phone_status()
+
+
+async def cmd_dbsearch(args, user_id, group_id, sender_name, is_group, bot_qq):
+    """检索聊天历史 /~回顾 <关键词> — 基于 SQLite 全文索引（ADDITIVE）"""
+    try:
+        from db.store import get_search_store
+    except Exception:
+        return "检索模块未启用喵~"
+    store = get_search_store()
+    if not store.available:
+        return "检索数据库未就绪（FTS5 缺失或初始化失败）喵~"
+    if not args:
+        c = store.count()
+        return f"用法: /~回顾 <关键词>\n当前已索引 {c} 条消息"
+    query = " ".join(args)
+    chat_id = group_id if is_group else None
+    rows = store.search_messages(query, chat_id=chat_id, limit=8)
+    if not rows:
+        return f"没找到和「{query}」相关的历史消息喵~"
+    lines = [f"【聊天回溯】关键词「{query}」命中 {len(rows)} 条:"]
+    for r in rows:
+        name = r.get("name") or str(r.get("user_id", "?"))
+        ts = r.get("ts") or 0
+        try:
+            tstr = time.strftime("%m-%d %H:%M", time.localtime(ts))
+        except Exception:
+            tstr = ""
+        content = str(r.get("content", ""))[:80].replace("\n", " ")
+        lines.append(f"  [{tstr}] {name}: {content}")
+    return "\n".join(lines)
+
+
+async def cmd_plugin(args, user_id, group_id, sender_name, is_group, bot_qq):
+    """/~plugin — 插件管理：list/status/install/unload/reload/pack/import/update"""
+    try:
+        from core.plugin import get_plugin_manager
+        from modules import plugin_share as ps
+    except Exception as e:
+        return f"插件系统未启用喵~ ({e})"
+    mgr = get_plugin_manager()
+
+    if not args or args[0].lower() in ("list", "ls", "status"):
+        mgr.discover()
+        rows = mgr.list()
+        if not rows:
+            lines = ["【插件列表】暂无插件"]
+        else:
+            lines = ["【插件列表】"]
+            for r in rows:
+                mark = {"enabled": "✅", "disabled": "⏸️", "error": "❌", "loaded": "📦", "discovered": "🗂️"}.get(r["state"], "•")
+                line = f"  {mark} {r['name']}@{r['version']} [{r['state']}]"
+                if r.get("error"):
+                    line += f" err={r['error']}"
+                lines.append(line)
+        lines.append("子命令: list | install <名|url> | unload <名> | reload <名> | pack <名> | import <url> | update [名]")
+        return "\n".join(lines)
+
+    sub = args[0].lower()
+    rest = args[1:]
+
+    async def _install_from(hmp_path, overwrite: bool) -> str:
+        ok, msg, conflict = ps.unpack_hmp(hmp_path, overwrite=overwrite)
+        if not ok:
+            if conflict:
+                name = conflict.get("name")
+                await mgr.unload(name) if name else None
+                ok2, msg2, _ = ps.unpack_hmp(hmp_path, overwrite=True)
+                if not ok2:
+                    return msg2
+                ok3, msg3 = await ps.load_local_plugin(name)
+                return msg3
+            return msg
+        name = conflict["name"] if conflict else ps.peek_hmp_name(hmp_path)
+        if not name:
+            return "无法识别插件名"
+        ok3, msg3 = await ps.load_local_plugin(name)
+        return msg3
+
+    if sub in ("install", "装"):
+        if not rest:
+            return "用法: /~plugin install <插件名|.hmp直链>"
+        target = rest[0]
+        if ps.is_hmp_url(target):
+            ok, msg = ps.download_hmp(target)
+            if not ok:
+                return msg
+            target = str(ps._down_dir() / ps.local_filename_for(target))
+            return await _install_from(ps._down_dir() / ps.local_filename_for(target), overwrite=False)
+        # 本地 _down 已有同名包？
+        local = ps._down_dir() / f"{target}{ps.HMP_EXT}"
+        if local.is_file():
+            return await _install_from(local, overwrite=False)
+        # 走插件库
+        ok, info, err = ps.lib_latest(target)
+        if not ok:
+            return f"插件库查询失败: {err}"
+        url = ps.lib_download_url(target)
+        ok, msg = ps.download_hmp(url)
+        if not ok:
+            return msg
+        return await _install_from(ps._down_dir() / ps.local_filename_for(url), overwrite=False)
+
+    if sub in ("import", "导入"):
+        if not rest or not ps.is_hmp_url(rest[0]):
+            return "用法: /~plugin import <.hmp直链>"
+        url = rest[0]
+        ok, msg = ps.download_hmp(url)
+        if not ok:
+            return msg
+        return await _install_from(ps._down_dir() / ps.local_filename_for(url), overwrite=False)
+
+    if sub in ("unload", "卸"):
+        if not rest:
+            return "用法: /~plugin unload <插件名>"
+        ok, msg = await mgr.unload(rest[0])
+        return msg if ok else f"卸载失败: {msg}"
+
+    if sub in ("reload", "重载"):
+        if not rest:
+            return "用法: /~plugin reload <插件名>"
+        ok, msg = await mgr.reload(rest[0])
+        return msg if ok else f"重载失败: {msg}"
+
+    if sub in ("pack", "打包"):
+        if not rest:
+            return "用法: /~plugin pack <插件名>"
+        ok, msg, path = ps.pack_plugin(rest[0])
+        if ok and path:
+            try:
+                from services.sender import send_file
+                await send_file(str(path), group_id if is_group else user_id, is_group)
+                return f"{msg}\n已发送 .hmp 包到本聊天"
+            except Exception:
+                return msg
+        return msg
+
+    if sub in ("update", "更新"):
+        if not rest:
+            # 列出可更新项
+            mgr.discover()
+            lines = ["【插件更新检查】"]
+            for r in mgr.list():
+                ok, info, err = ps.lib_latest(r["name"])
+                if ok:
+                    remote = str(info.get("version") or "0.0.0")
+                    local = r.get("version") or "0.0.0"
+                    if ps.compare_versions(remote, local) > 0:
+                        lines.append(f"  ⬆️ {r['name']}: {local} → {remote}（/~plugin update {r['name']}）")
+                    else:
+                        lines.append(f"  ✅ {r['name']}: 已是最新 v{local}")
+                else:
+                    lines.append(f"  ❓ {r['name']}: 库查询失败 {err}")
+            return "\n".join(lines)
+        name = rest[0]
+        ok, info, err = ps.lib_latest(name)
+        if not ok:
+            return f"插件库查询失败: {err}"
+        url = ps.lib_download_url(name)
+        ok, msg = ps.download_hmp(url)
+        if not ok:
+            return msg
+        hmp = ps._down_dir() / ps.local_filename_for(url)
+        await mgr.unload(name)
+        ok, msg, _ = ps.unpack_hmp(hmp, overwrite=True)
+        if not ok:
+            return msg
+        ok, msg = await ps.load_local_plugin(name)
+        return msg
+
+    return f"未知子命令: {sub}\n可用: list | install | unload | reload | pack | import | update"
+
+
+async def cmd_apy(args, user_id, group_id, sender_name, is_group, bot_qq):
+    """/~apy <token> 同意|拒绝 — 响应插件人工审批"""
+    try:
+        from core.config import get_config
+        if not get_config().is_admin(user_id, group_id):
+            return "只有管理员可以审批喵~"
+        if len(args) < 2:
+            return "用法: /~apy <token> 同意|拒绝"
+        from core.plugin.api import resolve_approval
+        approved = args[1] in ("同意", "yes", "y", "1", "approve", "ok")
+        return resolve_approval(args[0], approved)
+    except Exception as e:
+        return f"审批失败: {e}"
+
+
+# ════════════════════════════════════════════════════════════
+#  实验测试项开关 /~key
+# ════════════════════════════════════════════════════════════
+async def cmd_key(args, user_id, group_id, sender_name, is_group, bot_qq):
+    """实验测试项开关（全员可用，非管理员需先兑换许可码）
+
+    用法:
+      /~key                      列出全部测试项与当前状态
+      /~key 兑换 <许可码>         兑换许可码换取使用权
+      /~key <code>               激活该测试项
+      /~key <code> off           恢复默认行为（关闭）
+      /~key <code> reset         恢复为注册表默认值
+    """
+    cfg = get_config()
+    is_admin = cfg.is_admin(user_id, group_id)
+
+    from modules import licenses
+    from modules.features import FEATURES, list_features, resolve, reset, set_enabled
+
+    # ── 兑换许可码（任何人可兑换，不需要先有权限）──
+    if args and args[0] in ("兑换", "激活码", "许可", "redeem", "cdk"):
+        if len(args) < 2:
+            return "用法：/~key 兑换 <许可码>"
+        res = licenses.redeem(args[1], user_id)
+        if not res.get("ok"):
+            return res.get("msg", "兑换失败")
+        return (
+            f"{res['msg']}\n"
+            f"{res['desc']}\n"
+            f"现在可以正常用了，发 /~key 看测试项列表"
+        )
+
+    # ── 权限校验：管理员免码，其他人必须有有效许可 ──
+    if not is_admin:
+        st = licenses.check(user_id)
+        if not st.get("ok"):
+            reason = {
+                "expired": "你的许可已经过期了",
+                "used_up": "你的许可次数用完了",
+            }.get(st.get("reason"), "你还没有许可码")
+            kind = "、".join(f'{v["label"]}（{v["desc"]}）' for v in licenses.TYPES.values())
+            return (
+                f"{reason}，/~key 需要许可码才能用\n"
+                f"找管理员要一个，然后发：/~key 兑换 <许可码>\n"
+                f"许可码共三档：{kind}"
+            )
+
+    # 无参 → 列表
+    if not args:
+        items = list_features()
+        if not items:
+            return "当前没有可用的测试项喵~"
+        lines = ["【实验测试项】"]
+        for it in items:
+            code = it["code"]
+            state = "已激活" if it["on"] else "已关闭"
+            mark = "" if it["default"] else "（默认关闭）"
+            alias = "/".join(it["aliases"][:3])
+            lines.append(f"· {code}（{alias}）— {state}{mark}")
+            lines.append(f"     {it['desc']}")
+            if not it["on"]:
+                lines.append(f"     关闭后：{it['affects']}")
+        if not is_admin:
+            lines.append("")
+            lines.append(f"你的许可：{licenses.describe(user_id)}")
+        lines.append("")
+        lines.append("用法：/~key <名称> 激活 ｜ /~key <名称> off 恢复默认")
+        return "\n".join(lines)
+
+    code = resolve(args[0])
+    if not code:
+        known = "、".join(FEATURES.keys())
+        return f"没有这个测试项喵~\n可用：{known}\n（也可以发 /~key 看列表）"
+
+    action = (args[1].lower() if len(args) > 1 else "on")
+    meta = FEATURES[code]
+
+    if action in ("on", "开", "启用", "激活", "1", "true"):
+        set_enabled(code, True)
+        tail = ""
+        if not is_admin:
+            licenses.consume(user_id)     # 一次性许可在这里扣次数
+            tail = f"\n（{licenses.describe(user_id)}）"
+        return f"已激活测试项「{code}」喵~\n{meta['desc']}{tail}\n想恢复默认发：/~key {code} off"
+    if action in ("off", "关", "关闭", "恢复", "0", "false"):
+        set_enabled(code, False)
+        tail = ""
+        if not is_admin:
+            licenses.consume(user_id)
+            tail = f"\n（{licenses.describe(user_id)}）"
+        return f"已关闭测试项「{code}」，恢复默认行为喵~\n{meta['affects']}{tail}"
+    if action in ("reset", "重置", "默认"):
+        reset(code)
+        default_state = "开启" if meta.get("default") else "关闭"
+        return f"「{code}」已恢复注册表默认（{default_state}）喵~"
+
+    return f"不认识这个操作「{action}」喵~\n用法：/~key {code} ｜ /~key {code} off ｜ /~key {code} reset"
+
+
+COMMAND_MAP: dict[str, callable] = {
+    "help":       cmd_help,
+    "ping":       cmd_ping,
+    "restart":    cmd_restart,
+    "favlist":    cmd_favlist,
+    "info":       cmd_info,
+    "search":     cmd_search,  # LLM CALL 调用用
+    "search_web":  cmd_search,  # FC 工具名别名
+    "s":          cmd_search,  # 兼容 lang.toml 帮助文本中的 /~s 用法
+    "read":       cmd_read,
+    "whois":      cmd_whois,   # ★ 域名 WHOIS 查询
+    "域名":        cmd_whois,
+    "write_code":  cmd_write_code,  # ★ 代码生成
+    "ignore":      cmd_ignore,      # ★ 忽略用户
+    "unignore":    cmd_unignore,    # ★ 解除忽略
+    "天气":       cmd_weather,
+    "weather":    cmd_weather,
+    "reload":     cmd_reload,
+    "update":     _cmd_update,
+    "upd":        _cmd_update,    # 短别名
+    "gh":         _cmd_gh,
+    "添加关系":   cmd_add_relation,
+    "resetfav":   cmd_reset_fav,
+    "updateinfo": cmd_update_info,
+    "up":         cmd_update_info,
+    "box":        cmd_box,
+    "testsys":    cmd_testsys,
+    "testok":     cmd_testok,
+    "jsonraw":    cmd_jsonraw,
+    "md":         cmd_md,
+    "draw":       cmd_draw,
+    "绘画":       cmd_draw,
+    # ★ 2026-10-04: 看屏幕（本机截屏 + 视觉理解，仅主人，见 modules/screen.py）
+    "screen":     cmd_screen,
+    "屏幕":       cmd_screen,
+    "看屏幕":     cmd_screen,
+    "video":      cmd_video,
+    "视频":       cmd_video,
+    "voice":      cmd_voice,
+    "语音":       cmd_voice,
+    "img2video":  cmd_img2video,
+    "图生视频":   cmd_img2video,
+    "img":        cmd_img,
+    # img18 已移除注册（R18 指令下线），cmd_img18 逻辑保留待后续启用
+    "eq":         cmd_eq,
+    "地震":       cmd_eq,
+    "luck":       cmd_luck,
+    "op":         cmd_op,        # ★ OP 权限管理
+    "persona":    cmd_persona,   # ★ 私聊人格
+    "人格":       cmd_persona,
+    "主人":       cmd_master,    # ★ 私聊主人
+    "sleep":      cmd_sleep,     # ★ 睡觉模式
+    "含蓄":       cmd_hanxu,     # ★ 含蓄叙述风格
+    "叙事":       cmd_hanxu,
+    "recall":     cmd_recall,
+    "remind":     cmd_remind,
+    "提醒":       cmd_remind,
+    "抽":         cmd_chou,
+    "stats":      cmd_stats,
+    "统计":       cmd_stats,
+    "unstats":    cmd_unstats,
+    "setstats":   cmd_setstats,
+    "leave":      cmd_leave,
+    "preset":     cmd_preset,
+    "analyze":    cmd_analyze,
+    "owner":      cmd_owner,
+    "memory":     cmd_memory,
+    "nickname":   cmd_nickname,
+    "添加":       cmd_friend_add,
+    "拒绝":       cmd_friend_reject,
+    "好友列表":   cmd_friend_list,
+    "nasa":       cmd_nasa,
+    "pgr":        cmd_pgr,
+    "watch":      cmd_watch,
+    "spec":       cmd_watch,
+    "观战":       cmd_watch,
+    "wzq":        cmd_wzq,
+    "五子棋":     cmd_wzq,
+    "xq":         cmd_xq,
+    "象棋":       cmd_xq,
+    "go":         cmd_go,
+    "围棋":       cmd_go,
+    "tr":         cmd_translate,
+    "翻译":       cmd_translate,
+    "countdown":  cmd_countdown,
+    "倒计时":     cmd_countdown,
+    "wdsj":       cmd_wdsj,
+    "balance":    cmd_balance,
+    "cost":       cmd_cost,
+    "tokens":     cmd_tokens,
+    "cache":      cmd_cache,
+    "ctx":        cmd_ctx,
+    "note":       cmd_note,
+    "tuflevel":   cmd_tuflevel,
+    "tuf谱面":  cmd_tuflevel,
+    "tufsearch":  cmd_tuf_search,
+    "tufd":       cmd_tufd,
+    "tufpage":    cmd_tufpage,
+    "sys":        cmd_sys,
+    "pc":         cmd_sys,
+    "phone":      cmd_phone,
+    # ── SQLite 全文检索（聊天回溯）──
+    "dbsearch":   cmd_dbsearch,
+    "回顾":       cmd_dbsearch,
+    # ── 插件系统 ──
+    "plugin":     cmd_plugin,
+    "插件":       cmd_plugin,
+    "apy":        cmd_apy,          # 插件审批回执
+    # ── 管理员代发（/~say）──
+    "say":        cmd_say,
+    "代发":       cmd_say,
+    # ── 实验测试项开关（仅管理员）──
+    "key":        cmd_key,
+    "测试项":     cmd_key,
+    # ── 跨聊天记忆关联（单一英文入口 + 中文别名）──
+    "mlink":      cmd_mlink,
+    "记忆关联":   cmd_mlink,
+    # ── 赞赏码 / 赞助名单 ──
+    "reward":     cmd_reward,
+    "赞赏":       cmd_reward,
+    "赞助":       cmd_reward,
+    "sponsor":    cmd_reward,
+    # ── 服务器功耗 / 电费（仅管理员）──
+    "power":      cmd_power,
+    "功耗":       cmd_power,
+    "电费":       cmd_power,
+    # ── Steam 状态 / 价格 ──
+    "steam":      cmd_steam,
+    "在干嘛":     cmd_steam_doing,
+}
+
+
+# ── 重命令（含网络请求 / 图片渲染，单条耗时数秒级）────────────────
+# ★ v2.3.64：这些命令会被 core/queues.py 以旁路并发方式执行，**不占用本群 worker**。
+#   起因：per-group worker 串行 + 命令内 API/渲染全程 await → 同群多人同时查战绩要排队，
+#   且查询期间同群其他消息的回复被一起堵住（用户实测"卡回复"）。
+#   只列真正重的主命令；进程控制类（restart/reload/update）**故意不在列**，保持串行。
+HEAVY_COMMANDS: frozenset[str] = frozenset({
+    # 战绩 / 游戏数据
+    "wdsj", "steam", "在干嘛",
+    # 天气 / 地震 / NASA / PGR
+    "天气", "weather", "eq", "地震", "nasa", "pgr",
+    # 生成类（图/视频/语音）
+    "draw", "绘画", "video", "视频", "voice", "语音",
+    "img2video", "图生视频", "img",
+    # 谱面查询
+    "tuflevel", "tuf谱面", "tufsearch", "tufd", "tufpage",
+    # 抽卡 / 观战
+    "抽", "watch", "spec", "观战",
+    # 需要现拉数据的展示类
+    "power", "功耗", "电费",
+    "stats", "统计", "dbsearch", "回顾",
+    "reward", "赞赏", "赞助", "sponsor",
+    "sys", "pc", "phone",
+})
+
+
+def is_heavy_command(text: str) -> bool:
+    """判断指令文本是否属于重命令（→ core/queues.py 旁路并发执行）。"""
+    t = (text or "").strip()
+    if t.startswith("/~"):
+        t = t[2:]
+    elif t.startswith("/#"):
+        t = t[2:]
+    elif t.startswith("/") and len(t) > 1 and t[1] not in "~#/ ":
+        t = t[1:]
+    else:
+        return False
+    t = t.strip()
+    if not t:
+        return False
+    return t.split()[0].lower() in HEAVY_COMMANDS
+
+
+# ★ 2026-10-01: 帮助文案把参数写成 `<群号>` / `【关键词】`，而用户会**照抄尖括号**。
+#   实测 `/~owner gadd <<GROUP_3>>` → args[1] == '<<GROUP_3>>' → `.isdigit()` 为 False
+#   → 一路落到 `_owner_legacy` 末尾 → 回一句"未知操作: gadd"，用户完全看不懂。
+#   这里统一剥掉「**整体**被括号/引号包裹」的参数；只在首尾成对时才剥，
+#   不影响参数中间正常出现的尖括号（如 `a<b` 这类）。
+_ARG_WRAPPERS: tuple[tuple[str, str], ...] = (
+    ("<", ">"), ("【", "】"), ("[", "]"), ("（", "）"), ("(", ")"),
+    ("《", "》"), ("{", "}"), ('"', '"'), ("'", "'"), ("`", "`"),
+)
+
+
+def _strip_arg_wrapper(arg: str) -> str:
+    """剥掉参数整体的括号/引号包裹；不是成对包裹则原样返回。"""
+    for left, right in _ARG_WRAPPERS:
+        if len(arg) >= 3 and arg.startswith(left) and arg.endswith(right):
+            inner = arg[1:-1].strip()
+            if inner:
+                return inner
+    return arg
+
+
+async def handle_command(
+    text: str,
+    user_id: int,
+    group_id: int,
+    sender_name: str,
+    is_group: bool,
+    bot_qq: int,
+    raw_message: str = "",
+) -> str | None:
+    """
+    指令分发器。
+    
+    解析前缀(/~/ /#/) → 提取命令名和参数 → 查表 → 调用处理器 → 返回结果。
+    
+    Returns:
+        - 文本字符串: 需要作为普通消息发送
+        - "__SYS_TEST_CARD__": 需要由调用方构建并发送卡片
+        - None: 不需要回复
+    """
+    # 解析前缀和命令部分
+    if text.startswith("/~"):
+        prefix = "/~"
+        cmd_part = text[2:].strip()
+    elif text.startswith("/#"):
+        prefix = "/#"
+        cmd_part = text[2:].strip()
+    elif text.startswith("/") and len(text) > 1 and text[1] not in "~#/ ":
+        prefix = "/"
+        cmd_part = text[1:].strip()
+    else:
+        return None
+
+    if not cmd_part:
+        logger.warning("空指令内容: '%s'", text)
+        return format_lang("error.command_error")
+
+    # /# 前缀需要管理员权限 + 仅私聊
+    if prefix == "/#":
+        if is_group:
+            logger.warning("/#指令在群聊中使用被拒绝 user=%d", user_id)
+            return format_lang("error.permission_denied")
+        from core.config import get_config
+        cfg = get_config()
+        roles = load_roles_config()
+        if not cfg.is_admin(user_id, group_id):
+            logger.warning("非管理员使用/#指令 user=%d", user_id)
+            return format_lang("error.permission_denied")
+
+    # 提取命令名和参数
+    parts = cmd_part.split()
+    cmd_name = parts[0].lower()
+    args = parts[1:] if len(parts) > 1 else []
+    # ★ 剥掉照抄帮助占位符带来的括号（`<<GROUP_3>>` → `<GROUP_3>`），见 _strip_arg_wrapper
+    _raw_args = args
+    args = [_strip_arg_wrapper(a) for a in args]
+    if args != _raw_args:
+        logger.debug("参数已剥离占位符括号: %s → %s", _raw_args, args)
+
+    logger.debug("指令解析: prefix=%s cmd=%s args=%s user=%d", prefix, cmd_name, args, user_id)
+
+    handler = COMMAND_MAP.get(cmd_name)
+    if not handler:
+        logger.warning("未知指令: '%s%s'", prefix, cmd_name)
+        return format_lang("error.unknown_command", prefix=prefix, cmd=cmd_name)
+
+    # 执行处理器
+    try:
+        # 尝试传入 raw_message（img2video 等需要）
+        import inspect
+        sig = inspect.signature(handler)
+        if "raw_message" in sig.parameters:
+            result = await handler(args, user_id, group_id, sender_name, is_group, bot_qq, raw_message=raw_message)
+        else:
+            result = await handler(args, user_id, group_id, sender_name, is_group, bot_qq)
+        # 来源标注：插件注册的指令（bridge 带 __plugin__ 属性）
+        src = ""
+        if getattr(handler, "__plugin__", None):
+            src = f" (插件: {handler.__plugin__})"
+        if result is not None:
+            # 打印完整返回内容（不截断），方便排障
+            result_str = str(result)
+            logger.info("指令执行完成 [%s]%s: %s", cmd_name, src, result_str)
+        else:
+            logger.info("指令执行完成 [%s]%s: 无返回值（已自行发送）", cmd_name, src)
+        return result
+    except Exception as e:
+        err_type = type(e).__name__
+        err_msg = str(e)
+        logger.error("指令执行异常 [%s]: %s: %s", cmd_name, err_type, err_msg, exc_info=True)
+        return format_lang("error.command_error_detail", cmd=cmd_name, err=err_type, msg=err_msg)
+
+
+# ------每日排名HTML渲染------
+def _daily_rank_payload(rows, today, new_players, time_start="", time_end=""):
+    """组装起床战争日榜卡的数据载荷。
+
+    ★ v2.3.25 抽出为独立函数：HTML 模板注入与 Pillow 渲染器共用同一份数据，
+      避免两个渲染路径各拼一遍导致显示不一致（对比验证时曾因此得出错误结论）。
+      调用方若要 Pillow 渲染，直接把本函数返回值传给 wdsj_card_pillow。
+    """
+    import html as _html
+    from datetime import datetime
+
+    def esc(x):
+        return _html.escape(str(x), quote=True)
+
+    now = datetime.now()
+    next_time = f"{((now.hour // 4 + 1) * 4) % 24:02d}:01"
+
+    out_rows = []
+    for i, item in enumerate(rows, 1):
+        name, diffs, kd_val = item[0], item[1], item[2]
+        kd = diffs.get("kills", 0)
+        fd = diffs.get("finalKills", 0)
+        wd = diffs.get("wins", 0)
+        dd = diffs.get("deaths", 0)
+        out_rows.append({
+            "rank": i,
+            "name": name,
+            "cells": {
+                "name": esc(name),
+                "kills": f"+{kd}" if kd > 0 else "0",
+                "final": f"+{fd}" if fd > 0 else "",
+                "wins": f"+{wd}" if wd > 0 else "0",
+                "deaths": f"+{dd}" if dd > 0 else "0",
+                "kd": f"{kd_val:.2f}",
+            },
+        })
+
+    return {
+        "date": today,
+        "range": f"{time_start} → {time_end}" if (time_start or time_end) else "",
+        "when": "洛花星雨 Nexus",
+        "rows": out_rows,
+        "newPlayers": list(new_players or []),
+        "nextTime": next_time,
+        "brand": _bot_name(),
+    }
+
+
+def _build_daily_rank_html(rows, today, new_players, time_start="", time_end=""):
+    """起床战争日榜（模板 data/templates/daily_rank_card.html + 数据注入）"""
+    import json as _json
+    import time as _time
+    from pathlib import Path as _P
+
+    _t0 = _time.time() * 1000              # v2.3.32 页脚「渲染时间」起点
+    payload = _daily_rank_payload(rows, today, new_players, time_start, time_end)
+    # v2.3.22: 模板标题固定为"今日增量"，统计区间可能是昨日跨天（自动回退时）
+    #           → 用 date 字段覆盖标题显示真实归属日期
+    tpl = (_P(__file__).resolve().parent.parent / "data" / "templates" / "daily_rank_card.html").read_text(encoding="utf-8")
+    js = _json.dumps(payload, ensure_ascii=False).replace("</", "<\\/")
+    html = tpl.replace("/*__DAILY_DATA__*/null", js, 1)
+    # 副标题已含 date+range（D.date + " · " + D.range），无需额外处理
+    from services.card_base import inject_stamp
+    return inject_stamp(html, _t0)
+
+
+def _bot_name() -> str:
+    """当前 bot 名称（用于卡片署名）"""
+    try:
+        from core.config import get_config
+        return get_config().bot_name or "幻梦Bot"
+    except Exception:
+        return "幻梦Bot"
+
+
+def _arena_daily_payload(rows, today, time_start="", time_end=""):
+    """组装竞技场日榜卡的数据载荷。
+
+    ★ v2.3.25 与 _daily_rank_payload 对称抽出：HTML 注入与 Pillow 渲染共用同一份数据。
+    """
+    import html as _html
+    from datetime import datetime
+
+    def esc(x):
+        return _html.escape(str(x), quote=True)
+
+    now = datetime.now()
+    next_time = f"{((now.hour // 4 + 1) * 4) % 24:02d}:01"
+
+    out_rows = []
+    for i, item in enumerate(rows, 1):
+        name, diffs, kd_val, div = item[0], item[1], item[2], item[3]
+        name, div = esc(name), esc(div or "—")
+        kd = diffs.get("kills", 0)
+        wd = diffs.get("wins", 0)
+        ld = diffs.get("losses", 0)
+        dd = diffs.get("deaths", 0)
+        out_rows.append({
+            "rank": i,
+            "name": name,
+            "cells": {
+                "name": name,
+                "div": div,
+                "kills": f"+{kd}" if kd > 0 else "0",
+                "wins": f"+{wd}" if wd > 0 else "0",
+                "losses": f"+{ld}" if ld > 0 else "0",
+                "deaths": f"+{dd}" if dd > 0 else "0",
+                "kd": f"{kd_val:.2f}",
+            },
+        })
+
+    return {
+        "date": today,
+        "range": f"{time_start} → {time_end}" if (time_start or time_end) else "",
+        "when": "洛花星雨 Nexus",
+        "rows": out_rows,
+        "newPlayers": [],
+        "nextTime": next_time,
+        "brand": _bot_name(),
+    }
+
+
+def _build_arena_daily_html(rows, today, time_start="", time_end=""):
+    """竞技场日榜（模板 data/templates/daily_arena_card.html + 数据注入）"""
+    import json as _json
+    import time as _time
+    from pathlib import Path as _P
+
+    _t0 = _time.time() * 1000              # v2.3.32 页脚「渲染时间」起点
+    payload = _arena_daily_payload(rows, today, time_start, time_end)
+    tpl = (_P(__file__).resolve().parent.parent / "data" / "templates" / "daily_arena_card.html").read_text(encoding="utf-8")
+    js = _json.dumps(payload, ensure_ascii=False).replace("</", "<\\/")
+    html = tpl.replace("/*__DAILY_DATA__*/null", js, 1)
+    from services.card_base import inject_stamp
+    return inject_stamp(html, _t0)
+
+async def _render_html_to_png(html, prefix, width=740, height=900):
+    import time
+    ts = time.strftime("%Y%m%d_%H%M%S")
+    # JPEG 比 PNG 快约 3 倍（实测 0.55s vs 1.69s）且体积小 40%，卡片渐变/小图标质量无可见损失
+    out = str(Path(__file__).resolve().parent.parent / "data" / "img_temp" / f"{prefix}_{ts}.jpg")
+    from modules.changelog import _ensure_browser
+    try:
+        # ★ v2.3.23: 整体加 20s 超时兜底——渲染卡死（浏览器无响应/页面池耗尽）时
+        #   不让命令通道无限阻塞（per-group worker 单条消息总超时 200s 太长，用户等不起）
+        async def _do():
+            browser = await _ensure_browser()
+            page = await browser.new_page(viewport={"width": width, "height": height})
+            await page.set_content(html)
+            # ★ v2.3.23 提速: networkidle → domcontentloaded。卡片 HTML 是内联样式+内联图标，
+            #   无外部网络依赖，networkidle 会空等网络空闲（图片加载/长连接场景可等数秒）。
+            #   domcontentloaded 在 DOM 就绪即截图，配合下面 300ms 兜底足够渲染内联样式。
+            await page.wait_for_load_state("domcontentloaded")
+            await page.wait_for_timeout(300)
+            # 截 body 元素：自动贴合卡片宽度与内容高度，避免出现大片背景留白
+            el = await page.query_selector("body")
+            if el:
+                await el.screenshot(path=out, type="jpeg", quality=95)
+            else:
+                await page.screenshot(path=out, full_page=True, type="jpeg", quality=95)
+            await page.close()
+            return out
+        return await asyncio.wait_for(_do(), timeout=20.0)
+    except asyncio.TimeoutError:
+        logger = __import__("logging").getLogger("wdsj")
+        logger.error("卡片渲染超时(>20s)放弃: prefix=%s", prefix)
+        return None
+    except Exception:
+        return None

@@ -1,0 +1,1665 @@
+from __future__ import annotations
+
+import asyncio
+import re
+from pathlib import Path
+
+# ── 回复后处理：去重括号动作、修正语气分裂 ──
+_PARREN_ACTION = re.compile(r'[(（][^)）]*[)）]')
+
+def _clean_reply(text: str) -> str:
+    """修复语气分裂：连续多个括号动作描述只保留第一个"""
+    # 找末尾连续括号动作
+    matches = list(_PARREN_ACTION.finditer(text))
+    if len(matches) >= 2:
+        # 检查是否连续（无文字间隔）
+        consecutive = True
+        for i in range(1, len(matches)):
+            between = text[matches[i-1].end():matches[i].start()]
+            if between.strip():
+                consecutive = False
+                break
+        if consecutive:
+            # 只保留第一个
+            text = text[:matches[0].start()] + text[matches[0].start():matches[0].end()].strip()
+    return text
+
+from core.logger import get_logger
+from core.config import get_config
+from core.plugin import get_pipeline_hooks
+from utils.format_lang import format_lang
+from modules.judge import should_respond
+from modules.memory import (
+    get_top_memories,
+    maybe_save_memory,
+    load_memories as _load_memories_for_context,
+    search_msglog,
+)
+from modules.fav import update_fav, get_fav
+from modules.commands import handle_command
+from modules.search import auto_search_if_needed
+from services.llm import generate_multi_reply, generate_multi_reply_with_tools
+from services.sender import send_sentences, send_by_chat_type, send_raw_group, send_raw_user
+
+logger = get_logger("pipeline")
+
+# ------工具函数------
+def _make_interim_sender(chat_id: int, is_group: bool, user_id: int,
+                         thought_ctx: dict | None = None,
+                         sent_lead: list[str] | None = None):
+    """构造 FC 先导语发送回调（v2.0.4y）：LLM 调工具前写的自然语先导语，
+    经此先发给用户，避免搜索/查询期间 10s+ 干等。与正常回复同走 send_sentences，
+    保持 stats/msglog 录制一致；先导语为单条，间隔压到 0.2s。
+
+    v2.1.12: thought_ctx 共享思考状态 {"secs": int|None, "applied": bool}——
+    先导语是用户看到的第一条文本，若已思考则把 [已思考N秒] 挂在这里并置 applied，
+    主回复段检测 applied 后不再重复挂。
+
+    ★ v2.3.23: sent_lead 记录已发出的先导语原文。事故背景：FC 最终轮的 LLM
+    常把轮 1 写过的先导语再写一遍（实测 "诶？真要全打呀…" 被隔 18s 发了两遍），
+    用户看到重复句子。这里留痕，主回复发送前做去重（见 _dedup_against_lead）。"""
+    async def _send(text: str):
+        try:
+            # ★ v2.3.36: 先导语也必须按 || 拆分。
+            #   事故（2026-09-17 实测）：LLM 在轮1把先导语写成一串多句
+            #     "诶？主人你这是让我把赞赏码发出来呀～ || 那我试试，不过文件要是还没传上去…"
+            #   而这里原来写死 send_sentences([text], ...) 整条发出，
+            #   "||" 就原样泄漏到群里。口径与主回复对齐（主回复按 " || " 拆）。
+            parts = [p.strip() for p in re.split(r'\|\|\|?', text) if p.strip()]
+            parts = [re.sub(r'\|', '', p).strip() for p in parts]
+            parts = [p for p in parts if p][:3]   # 上限 3 条，防刷屏
+            if not parts:
+                # 整条只有分隔符/空白 → 没有可发内容，别把 "||" 发出去
+                if not re.sub(r'\|', '', text).strip():
+                    return
+                parts = [re.sub(r'\|', '', text).strip()]
+            for idx, part in enumerate(parts):
+                # v2.1.12: 思考标记只挂第一条（用户看到的第一条文本）
+                if (idx == 0 and thought_ctx and thought_ctx.get("secs")
+                        and not thought_ctx.get("applied")):
+                    part = f"[已思考{thought_ctx['secs']}秒] {part}"
+                    thought_ctx["applied"] = True
+                await send_sentences(
+                    [part], chat_id, is_group,
+                    user_id=user_id if not is_group else None,
+                    min_interval=0.2, max_interval=0.2,
+                )
+                if sent_lead is not None:
+                    sent_lead.append(part)
+        except Exception:
+            logger.warning("先导语发送失败: %s", str(text)[:30], exc_info=True)
+    return _send
+
+
+def _norm_for_dup(s: str) -> str:
+    """去重比对用归一化：剥掉空白、常见句尾标点与语气符号。"""
+    return re.sub(r'[\s~～。！？!?…、，,\.；;：:—\-「」『』"\'”’“”]', '', s or "")
+
+
+def _dedup_against_lead(sentences: list[str], sent_lead: list[str]) -> list[str]:
+    """过滤掉与已发先导语重复的句子（v2.3.23）。
+
+    判定：归一化后完全相等，或一方是另一方前缀且短句占长句 ≥70%（容忍尾部加字/
+    加语气词，如先导语"……屏幕得刷成瀑布了" vs 正文"……屏幕得刷成瀑布了～"）。
+    只在真有先导语发出时生效；全部被滤掉时返回原列表（宁可略显重复，也不能让回复为空）。
+    """
+    if not sent_lead:
+        return sentences
+    leads = [_norm_for_dup(x) for x in sent_lead if x]
+    leads = [x for x in leads if len(x) >= 4]
+    if not leads:
+        return sentences
+    out = []
+    for s in sentences:
+        ns = _norm_for_dup(s)
+        dup = False
+        for ld in leads:
+            if ns == ld:
+                dup = True
+                break
+            short, long = (ns, ld) if len(ns) <= len(ld) else (ld, ns)
+            if short and short in long and len(short) >= 0.7 * len(long):
+                dup = True
+                break
+        if dup:
+            logger.info("先导语去重: 丢弃重复句 '%s'", s[:40])
+        else:
+            out.append(s)
+    return out or sentences
+
+def _make_thought_cb(thought_ctx: dict):
+    """v2.1.12: 构造思考标记回调——LLM 思考完（reasoning 产出）→ 仅记录时长。
+    由先导语发送方 / 主回复发送段在真正发出文本时消费并置 applied（去重）。"""
+    async def _cb(secs: int):
+        try:
+            if secs < 2:      # 思考太短没意义，不加前缀
+                return
+            thought_ctx["secs"] = max(thought_ctx.get("secs") or 0, secs)
+        except Exception:
+            logger.warning("思考标记回调异常: %s", exc_info=True)
+    return _cb
+
+def _clean_name(name):
+    return re.sub(r'[\u200b\u200c\u200d\u200e\u200f\u202a-\u202e\u2060-\u2069\ufeff]+', '', str(name))
+
+
+# ------戳一戳------
+# ★ 戳一戳**读会话上下文**（用户 2026-09-14 明确要求，别改成不读）。
+#   曾一度改成"不读上下文"被用户纠正（原话「读上下文!!!」）。
+#   下面这个缓冲是**补充**：上下文里只有 "[系统] 某某摸了摸幻梦的头" 这样的动作记录，
+#   没有 bot 自己上次的回应，防复读规则（poke_rules 第 2 条）缺料，所以单独记一份。
+_POKE_KEEP = 5
+# ★ 2026-09-30：喂给 LLM 的上下文只取最近几条。
+#   实测（scripts/_probe_poke_habit.py，每变体 8 次采样、同一批上下文）：
+#     喂全量上下文 → 回应里出现上文话题词的比例 A 100% / B 88%
+#     只喂最近 2 条 → A 50% / B 0%，平均长度也从 19/18 字降到 12/15 字
+#   原因：戳一戳本身没有内容可回应，模型只能抓上下文里最显著的名词来"接话"——
+#   给的素材越多，能被复述的就越多，"复述+调侃"的公式感就是这么来的。
+#   要判断"现在是什么气氛"，最近 1~2 条足够。
+_POKE_CTX_TAIL = 2
+_poke_replies: dict[int, list[str]] = {}
+
+
+def _poke_context_for_llm(chat_id: int) -> list:
+    """戳一戳喂给 LLM 的会话上下文：只取最近 _POKE_CTX_TAIL 条"""
+    try:
+        from core.context_manager import get_context_mgr
+        full = get_context_mgr().get_context(chat_id) or []
+    except Exception:
+        return []
+    return list(full[-_POKE_CTX_TAIL:]) if _POKE_CTX_TAIL else list(full)
+
+
+def _poke_said_note(chat_id: int) -> str:
+    """我自己最近几次的戳一戳回应 —— 作为清单提醒"别重复"。
+
+    ⚠️ 不要再拼进 msg_history：那等于发给模型一份"句式和口癖的模仿样本"
+    （实测 bot 全部发言里首字「诶」占 18.3%，自我模仿是主因之一：
+    上文里连续几条「诶，XXX」→ 它接着「诶，……」）。
+    改放 extra_info 并写明"这些不是聊天记录"，防复读的目的照样达到。
+    """
+    said = _poke_replies.get(chat_id) or []
+    if not said:
+        return ""
+    return ("你最近几次被戳时的回应（**这些不是聊天记录**，只是提醒你别再重复这些说法）：\n"
+            + "\n".join("  · " + x for x in said))
+
+
+def _remember_poke_reply(chat_id: int, text: str) -> None:
+    buf = _poke_replies.setdefault(chat_id, [])
+    buf.append(text)
+    del buf[:-_POKE_KEEP]
+
+
+async def handle_poke_event(sender_name, user_id, chat_id, is_group):
+    from core.context_manager import get_context_mgr
+    cfg = get_config()
+    ctx = get_context_mgr()
+
+    sender_name = _clean_name(sender_name)
+
+    from modules.fav import ensure_fav
+    ensure_fav(chat_id, user_id, is_group)
+
+    # ★ 分群感知显示名（戳一戳也要用当前群的昵称）
+    display_name = cfg.get_display_name(user_id, chat_id) if is_group else (sender_name or str(user_id))
+    speaker_label = display_name if display_name != str(user_id) else sender_name
+
+    system_msg = format_lang("poke.message", name=speaker_label, bot_name=cfg.bot_name)
+    ctx.append_to_context(chat_id, f"[系统] {system_msg}")
+    logger.info("🐾 戳一戳回复流程启动: from=%s chat=%d", speaker_label, chat_id)
+
+    related_memories = get_top_memories(system_msg, ctx.get_context(chat_id), chat_id=chat_id)
+    fav_val = get_fav(chat_id, user_id, is_group)
+    fav_info = f"当前{speaker_label}对你的好感度：{fav_val}/100"
+
+    extra_parts = []
+    from datetime import datetime
+    now = datetime.now()
+    now_str = now.strftime("%Y年%m月%d日 %H:%M:%S") + f".{now.microsecond // 1000:03d}"
+    weekdays = "日一二三四五六"
+    now_str += f" 周{weekdays[int(now.strftime('%w'))]}"
+    extra_parts.append(f"当前时间：{now_str}")
+
+    from modules.preset import get_preset
+    active_preset = get_preset(chat_id)
+    if active_preset:
+        extra_parts.append(f"【系统注入指令 — 你必须严格遵守，优先级高于人设】\n{active_preset}")
+    if related_memories:
+        extra_parts.append(related_memories)
+    # ★ v2.1.1: 注入笔记本
+    try:
+        from core.bot_notes import load_notes
+        _notes_p = load_notes(chat_id)
+        if _notes_p:
+            extra_parts.append(_notes_p)
+    except Exception:
+        pass
+    extra_parts.append(fav_info)
+    # ★ 2026-09-30: "自己上次怎么回的"从 msg_history 挪到这里，只当"别重复"的清单
+    _said_note = _poke_said_note(chat_id)
+    if _said_note:
+        extra_parts.append(_said_note)
+
+    # ★ v2.3.65: 戳一戳规则从硬编码搬到 data/skills/40_reminders.md::poke_reminder
+    #   （原先写死在这里，违反"提示词唯一落点 = data/skills/*.md"的约定）。
+    #   旧规则的三处病：①「不要展开话题」直接禁止结合上下文；② 从固定 6 种情绪里
+    #   随机抽签；③ 把"别摸啦/再摸要炸毛了"这类自然短句全禁掉 → 结果必然是与正在
+    #   聊的内容脱节的罐头台词。新规则改为「反应必须长在上下文上」。
+    #   append_plain=False：后面 _build_messages 还会拼一次 reply_reminder（自带
+    #   plain_text_rule），这里再追加就重复了。
+    from services.llm import _build_reminder
+    poke_rules = [_build_reminder("poke_reminder", append_plain=False)]
+
+    try:
+        from modules.op import get_mode, get_sleep_prompt_rule, get_narrative_prompt_rule
+        mode = get_mode(chat_id)
+        if mode == "sleeping":
+            poke_rules = [get_sleep_prompt_rule(chat_id)]
+        elif mode == "narrative":
+            poke_rules = [get_narrative_prompt_rule()]
+    except ImportError:
+        pass
+    extra_parts.extend(poke_rules)
+
+    buffer_snapshot = list(ctx.get_buffer(chat_id))
+
+    sentences, fav_change, llm_calls, face_cq, mood, mood_detail, action, at_qq, mode_switch, origin, actor, _ = await generate_multi_reply_with_tools(
+        # ★ 戳一戳**必须读上下文**（用户 2026-09-14 明确要求，别改成不读）——
+        #   但只喂最近 _POKE_CTX_TAIL 条：全量喂会诱导模型复述上文话题（见该常量注释）。
+        #   自己上次怎么回的放在 extra_info 的清单里，不再混进对话历史（见 _poke_said_note）。
+        msg_history=_poke_context_for_llm(chat_id),
+        speaker_name=speaker_label,
+        current_msg=f"[系统] {system_msg}",
+        bot_name=cfg.bot_name,
+        system_prompt=cfg.system_prompt,
+        reply_model=cfg.reply_model,
+        is_group=is_group,
+        extra_info="\n".join(extra_parts),
+        max_tokens=None,
+        user_id=user_id, group_id=chat_id if is_group else 0, bot_qq=cfg.bot_qq,
+        interim_cb=_make_interim_sender(chat_id, is_group, user_id),
+    )
+
+    if sentences:
+        # v2.3.14: 戳一戳也要发表情 —— 原来这里直接把 [FACE:xxx] 删掉
+        #   （注释写"LLM 不该输出这个"），是 v2.3.6"群聊禁表情"那批误判的残留。
+        #   戳一戳是纯情绪反应，正是最该配图的地方。改为主路径同样的逐句配图。
+        _face_re = re.compile(r'\[FACE:([^\]]*)\]?')
+        _poke_faces: list[str | None] = []
+        _clean: list[str] = []
+        for _s in sentences:
+            _kw = next((k.strip() for k in _face_re.findall(_s) if k.strip()), "")
+            _txt = _face_re.sub("", _s).strip()
+            _cq = None
+            if _kw:
+                try:
+                    from modules.face_lib import get_face, make_cq
+                    _fp = get_face(_kw)
+                    if _fp:
+                        _cq = make_cq(_fp)
+                    else:
+                        logger.debug("戳一戳表情未匹配关键词: %s", _kw)
+                except Exception:
+                    logger.warning("戳一戳表情解析失败: %s", _kw, exc_info=True)
+            if not _txt and not _cq:
+                continue
+            _clean.append(_clean_reply(_txt) if _txt else "")
+            _poke_faces.append(_cq)
+        # 文字与配图对齐（空文字只发图的情况也要保留）
+        sentences = [s for s in _clean if s] or ["喵~"]
+        if len(sentences) != len(_poke_faces):
+            _poke_faces = _poke_faces[:len(sentences)] or [None] * len(sentences)
+
+        task = asyncio.create_task(send_sentences(
+            sentences, chat_id, is_group,
+            user_id=user_id if not is_group else None,
+            faces=_poke_faces,
+        ))
+        ctx.set_active_send_task(chat_id, task)
+
+        update_fav(chat_id, user_id, 1, is_group)
+        _remember_poke_reply(chat_id, " ".join(sentences))   # 防复读缓冲
+        logger.info("戳一戳回复完成: %d句 fav+1", len(sentences))
+
+        await maybe_save_memory(system_msg, sentences[0], speaker_label, chat_id, user_id, buffer_snapshot)
+
+
+# ------消息处理主入口------
+def _ctx_safe(text: str, limit: int = 200) -> str:
+    """写进对话上下文前的清洗（v2.3.10）。
+
+    为什么需要：调用结果里常带完整 CQ 码（如 /~赞赏 的 `[CQ:image,file=...]`）
+    和大段成品文案，原样写进上下文会白烧 token 还会让模型看到裸 CQ 码犯迷糊。
+    统一把 CQ 码换成占位符并截断。
+    """
+    s = str(text or "")
+    s = re.sub(r"\[CQ:image[^\]]*\]", "[图片]", s)
+    s = re.sub(r"\[CQ:face[^\]]*\]", "[表情]", s)
+    s = re.sub(r"\[CQ:at[^\]]*\]", "@", s)
+    s = re.sub(r"\[CQ:[^\]]*\]", "[消息]", s)
+    return s[:limit]
+
+
+def extract_inline_face(text: str) -> tuple:
+    """抽出文本里的 [FACE:关键词] → (去掉标记的文本, 表情 CQ 或 None)
+
+    ★ v2.3.27: 补充句（follow-up）路径原本只清理 [fav:N]，漏了 [FACE:]，
+      导致 "[FACE:疲惫]" 原样发给用户（实测 2026-09-16 私聊泄漏）。
+      主回复与戳一戳路径一直有这段逻辑，这里抽成公共函数复用。
+    """
+    if not text:
+        return text, None
+    _re_face = re.compile(r'\[FACE:([^\]]*)\]?')
+    kws = [k.strip() for k in _re_face.findall(text) if k.strip()]
+    clean = _re_face.sub("", text).strip()
+    cq = None
+    if kws:
+        try:
+            from modules.face_lib import get_face, make_cq
+            for kw in kws:
+                fp = get_face(kw)
+                if fp:
+                    cq = make_cq(fp)
+                    logger.info("表情匹配(补充句): 关键词=%s", kw)
+                    break
+            else:
+                logger.debug("表情库未匹配(补充句): %s", kws)
+        except Exception:
+            logger.warning("补充句表情解析失败: %s", kws, exc_info=True)
+    return clean, cq
+
+
+async def process_message(msg_type, msg_content, chat_id, sender_name, user_id, is_group, bot_qq,
+                          raw_event=None, raw_message="", quoted_msg="", error_report=None,
+                          **extra_kwargs):
+    """消息处理主管道。
+    **extra_kwargs 用于前向兼容：避免未来 dispatcher/enqueue 新增参数时
+    process_message 签名不匹配直接抛出 TypeError 导致全量消息静默（P0 事故）。
+    """
+    if extra_kwargs:
+        logger.debug("process_message 收到未识别扩展参数: %s", list(extra_kwargs.keys()))
+    import time as _tm
+    _t_pipe_start = _tm.monotonic()   # ★ v2.0.4r 阶段打点：单条消息总耗时
+    from core.context_manager import get_context_mgr
+    cfg = get_config()
+    ctx = get_context_mgr()
+
+    sender_name = _clean_name(sender_name)
+
+    # ------插件管道预钩子（on_message）------
+    _pre_hooks = get_pipeline_hooks().all_pre_hooks()
+    if _pre_hooks:
+        _msg_dict = {
+            "msg_type": msg_type, "msg_content": msg_content,
+            "chat_id": chat_id, "sender_name": sender_name,
+            "user_id": user_id, "is_group": is_group,
+            "bot_qq": bot_qq, "raw_message": raw_message,
+            "quoted_msg": quoted_msg,
+        }
+        for hook in _pre_hooks:
+            try:
+                # ★ v2.0.4r: 单 hook 10s 超时，防插件 hook 卡死整条消息
+                result = await asyncio.wait_for(hook(_msg_dict), timeout=10.0)
+                if result is not None and isinstance(result, str):
+                    await send_by_chat_type(result, chat_id, is_group, user_id if not is_group else None)
+                    return
+            except asyncio.TimeoutError:
+                logger.warning("插件 pre-hook 超时跳过: %s", getattr(hook, "__name__", hook))
+            except Exception:
+                pass
+
+    # 首次对话自动注册好感度
+    from modules.fav import ensure_fav
+    ensure_fav(chat_id if is_group else user_id, user_id, is_group)
+
+    # ------空消息拦截（v2.1.15）------
+    # 现象：用户误触发送空消息 → 上下文出现 "[admin] Trusler[fav=50]: "（空内容），
+    # 随即 bot 回"嗯，在呢 || 主人想说什么"，属于瞎答。
+    # 根因：下面清洗块的条件是 `if msg_type == "文字" and msg_content:`，
+    # 空串本身为假 → 整块被跳过 → 既不 return 也没有可回复的内容，
+    # 却继续走到回复判断（私聊 should_reply 恒为 True）→ LLM 拿到空消息凭空编。
+    # 空消息没有任何可回应的信息量，直接丢弃，连上下文都不记。
+    if msg_type == "文字" and not (msg_content or "").strip():
+        logger.info("[chat=%d] 空消息（无有效内容），已跳过", chat_id)
+        return
+
+    # ------清洗不可见字符------
+    import re as _re
+    if msg_type == "文字" and msg_content:
+        _invisible = _re.compile(
+            r'[\u200b\u200c\u200d\u200e\u200f\u202a\u202b\u202c\u202d\u202e'
+            r'\u2060-\u2064\u2066-\u2069\ufeff]+'
+        )
+        cleaned = _invisible.sub('', msg_content)
+        if cleaned != msg_content:
+            logger.info("[chat=%d] 清洗不可见字符: %d → %d 字符", chat_id, len(msg_content), len(cleaned))
+            msg_content = cleaned
+        if not msg_content.strip():
+            logger.info("[chat=%d] 消息全为不可见字符，跳过处理", chat_id)
+            return
+
+    # ------管理员提示词注入------
+    if msg_type == "文字" and "{{" in msg_content:
+        role_tag = cfg.get_user_tag(user_id)
+        if role_tag == "admin":
+            from modules.preset import extract_preset_from_message, set_preset, clear_preset
+            preset_text, cleaned = extract_preset_from_message(msg_content)
+            if preset_text:
+                if preset_text.lower() == "reset":
+                    cleared = clear_preset(chat_id)
+                    reply = "提示词已重置喵~ (｡･ω･｡)" if cleared else "当前没有注入的提示词喵~"
+                else:
+                    set_preset(chat_id, preset_text)
+                    reply = f"提示词已注入喵~ ({len(preset_text)}字) 🔒"
+                if is_group:
+                    await send_by_chat_type(reply, chat_id, is_group=True)
+                else:
+                    await send_by_chat_type(reply, chat_id, is_group=False, user_id=user_id)
+                if cleaned:
+                    msg_content = cleaned
+                else:
+                    return
+
+    # ------引用消息注入------
+    if quoted_msg:
+        quote_line = f"[引用原文] {quoted_msg}"
+        ctx.append_to_context(chat_id, _ctx_safe(quote_line, 300))
+        logger.info("📎 引用消息已注入上下文 [%d]: '%s'...", chat_id, quoted_msg[:50])
+
+    # ------上下文记录------
+    role_tag = cfg.get_user_tag(user_id, chat_id if is_group else 0)
+    if not is_group and role_tag not in ("admin",):
+        try:
+            from modules.op import is_private_master
+            if is_private_master(user_id):
+                role_tag = "admin"
+        except ImportError:
+            pass
+    # ★ 显示名：事件自带 card 优先（dispatcher 已处理），缺失时用分群/全局映射补全
+    display_name = sender_name
+    if not display_name or display_name == str(user_id):
+        mapped = cfg.get_display_name(user_id, chat_id)
+        display_name = mapped if mapped else sender_name
+    fav_val = get_fav(chat_id, user_id, is_group)
+
+    # ★ 好感度 -100 → 直接忽略
+    if fav_val <= -100:
+        logger.warning("好感度-100忽略: uid=%d(%s) chat=%d fav=%d", user_id, sender_name, chat_id, fav_val)
+        return
+
+    context_line = f"[{role_tag}] {display_name}[fav={fav_val}]: {msg_content}"
+
+    buffer_text = f"{display_name}: {msg_content}"
+    if quoted_msg:
+        buffer_text = f"{display_name} (回复「{quoted_msg[:80]}」): {msg_content}"
+    ctx.append_to_buffer(chat_id, buffer_text)
+
+    from modules.stm import add_entry as stm_add
+    stm_add(chat_id, role_tag, f"{display_name}: {msg_content}", display_name)
+
+    # ------指令拦截------
+    # /~ /# / 三种前缀都触发指令
+    import re as _re
+    cmd_match = _re.match(r'(/(?:~|#|(?=[a-zA-Z])))\s*(\S[\s\S]*?)(?:\s*$|\s*\n)', msg_content)
+    if not cmd_match:
+        cmd_match = _re.match(r'(/(?:~|#|(?=[a-zA-Z])))(\S[\s\S]*)', msg_content)
+    if cmd_match:
+        full_cmd = cmd_match.group(0)
+        logger.info("指令拦截: '%s' from=%s", full_cmd, sender_name)
+        await _handle_command_route(full_cmd, user_id, chat_id, sender_name, is_group, bot_qq, raw_message=raw_message)
+        return
+
+    if msg_type != "文字":
+        logger.debug("非文字消息(type=%s)，不进入回复管道", msg_type)
+        return
+
+    # ★ 指令和非文字消息不写入 LLM 上下文（避免污染）
+    # 只有进入回复管道的消息才写入 group_context
+    ctx.append_to_context(chat_id, context_line)
+
+    # ------回复判断------
+    should_reply = False
+    import re as _re
+    # ★ v2.0.4ab(2026-09-04): @ 检测只信权威来源——raw_message 的 CQ at 段 qq=bot_qq。
+    #   v2.0.4aa 曾加 @bot_name 文本匹配(如 @幻梦)兜底 → 群友昵称同名时 @真人也被
+    #   误判成 @bot（用户实测）。文本 @名字无法区分 QQ，必须回到 at 段 QQ 号判断。
+    #   msg_content 里 @bot_qq 数字仅作 raw 无 CQ 形态时的兜底。
+    is_mentioned = bool(
+        (raw_message and _re.search(rf'\[CQ:at,qq={bot_qq}[,\]]', str(raw_message)))
+        or _re.search(rf'@{bot_qq}(?!\d)', msg_content)
+    )
+    group_setting = cfg.group_settings.get(chat_id, {}) if is_group else {}
+    at_only = group_setting.get("at_only", False)
+    custom_threshold = group_setting.get("reply_threshold")
+
+    if not is_group:
+        should_reply = True
+        logger.debug("私聊消息 → 直接回复")
+    elif at_only:
+        should_reply = is_mentioned
+    elif is_mentioned:
+        should_reply = True
+        logger.info("@机器人检测 → 直接回复")
+    elif is_group and re.search(r"@\S+", msg_content):
+        logger.debug("@他人消息 [群%d] → SKIP", chat_id)
+    else:
+        should_reply = await should_respond(
+            msg_content, msg_type, sender_name, chat_id,
+            ctx.get_context(chat_id), cfg.bot_name, bot_qq,
+            reply_threshold_override=custom_threshold,
+        )
+    logger.debug("PIPE 回复判断完成 耗时%.2fs → should_reply=%s (total %.2fs)",
+                 _tm.monotonic() - _t_pipe_start, should_reply, _tm.monotonic() - _t_pipe_start)
+
+    if not should_reply:
+        return
+
+    # ------自忽略机制------
+    from services.self_ignore import is_ignored, ignore_user, remaining_seconds
+    if is_group and is_ignored(user_id):
+        logger.info("用户%d在忽略列表中，跳过回复 (%ds后解除)", user_id, remaining_seconds(user_id))
+        return
+
+
+    # ------记忆检索+好感度+上下文组装------
+    full_msg = f"[{role_tag}] {display_name}发了: {msg_content}"
+    related_memories = get_top_memories(msg_content, ctx.get_context(chat_id), chat_id=chat_id)
+    fav_val = get_fav(chat_id, user_id, is_group)
+
+    # ------自身认知注入（v2.1.16）------
+    # 用户问"你的记忆存在哪""你的架构是怎样的""你会什么"时，要答得准。
+    # 旧实现只认 architecture.mermaid（提取成节点列表）——那张图停在 v0.9.6，
+    # 还写着 deepseek-chat，且完全没有"数据存哪"的信息，所以 bot 答不准。
+    # 现在优先走 data/self_knowledge.md（按需取章节、内容准确、已脱敏），
+    # 取不到再回退旧的 mermaid 提取。
+    # 注：版本/更新日志已由 system 的 self_awareness 常驻，这里不再重复触发，省 token。
+    arch_context = ""
+    _self_keywords = [
+        "记忆", "记住", "存哪", "存在哪", "存储", "存到", "数据放", "笔记", "笔记本",
+        "数据库", "回顾", "遗忘", "架构", "模块", "结构", "分层", "组成",
+        "会什么", "会啥", "能做什么", "能干啥", "能力", "功能",
+        "模型", "用的什么", "怎么实现", "怎么做的", "你的实现", "介绍你自己",
+    ]
+    msg_for_arch = msg_content[-200:].lower()
+    if any(kw in msg_for_arch for kw in _self_keywords):
+        try:
+            from core.arch_loader import get_self_knowledge
+            arch_context = get_self_knowledge(msg_content)
+        except Exception as e:
+            logger.debug("自我认知加载失败: %s", e)
+            arch_context = ""
+        if not arch_context:
+            try:
+                from core.config import get_architecture_context
+                arch_context = get_architecture_context()
+            except Exception:
+                arch_context = ""
+        if arch_context:
+            logger.debug("自身认知已注入 (%d chars)", len(arch_context))
+
+    extra_info_parts = []
+    from datetime import datetime
+    now = datetime.now()
+    now_str = now.strftime("%Y年%m月%d日 %H:%M:%S") + f".{now.microsecond // 1000:03d}"
+    weekdays = "日一二三四五六"
+    now_str += f" 周{weekdays[int(now.strftime('%w'))]}"
+    extra_info_parts.append(f"当前时间：{now_str}")
+
+    # 节假日信息
+    try:
+        from modules.holiday import get_today_holiday_text
+        holiday_text = get_today_holiday_text()
+        if holiday_text:
+            extra_info_parts.append(holiday_text)
+    except Exception:
+        pass
+
+    from modules.preset import get_preset
+    active_preset = get_preset(chat_id)
+    if active_preset:
+        extra_info_parts.append(f"【系统注入指令 — 你必须严格遵守，优先级高于人设】\n{active_preset}")
+    if related_memories:
+        extra_info_parts.append(related_memories)
+
+    # ★ v2.1.1: 注入 LLM 自己维护的笔记本（长期群内记忆，缓存友好放末尾）
+    try:
+        from core.bot_notes import load_notes
+        _notes_text = load_notes(chat_id)
+        if _notes_text:
+            extra_info_parts.append(_notes_text)
+    except Exception:
+        pass
+
+    # ★ v2.3.11 跨聊天记忆关联：来自其他会话的近期交流（带来源标识，放末尾对缓存友好）
+    try:
+        from modules.memory_link import build_linked_context, chat_key as _mlink_key
+        _linked_txt = build_linked_context(_mlink_key(chat_id, is_group), ctx)
+        if _linked_txt:
+            extra_info_parts.append(_linked_txt)
+            logger.info("跨聊天记忆注入: %d 字", len(_linked_txt))
+    except Exception as e:
+        logger.debug("跨聊天记忆注入失败: %s", e)
+
+    if not related_memories or len(related_memories) < 300:
+        try:
+            msglog_context = get_msglog_context(msg_content, ctx.get_context(chat_id), chat_id)
+            if msglog_context:
+                extra_info_parts.append(msglog_context)
+        except Exception:
+            pass
+
+    try:
+        img_keywords = ["图", "照片", "截图", "表情", "什么", "是谁", "这是"]
+        has_img_ref = any(k in msg_content[-20:] for k in img_keywords) or msg_content == "[图片]"
+        has_img_in_recent = any("[图片]" in l for l in ctx.get_context(chat_id)[-5:] if isinstance(l, str))
+        if has_img_ref or has_img_in_recent:
+            from services.image_api import get_recent_image_descriptions
+            recent_imgs = get_recent_image_descriptions(chat_id=chat_id, limit=2)
+            if recent_imgs:
+                img_lines = ["【本群最近图片描述（如果还没识别完则为空，不知道就直说不知道）】"]
+                for img in recent_imgs:
+                    img_lines.append(f"- {img.get('desc', '?')[:100]} (来自 {img.get('author', '?')})")
+                extra_info_parts.append("\n".join(img_lines))
+    except Exception:
+        pass
+
+    extra_info_parts.append(f"当前{display_name}对你的好感度：{fav_val}/100")
+
+    if is_group:
+        at_list = _build_at_list(ctx.get_context(chat_id), cfg, group_id=chat_id)
+        if at_list:
+            extra_info_parts.append(at_list)
+
+    if arch_context:
+        extra_info_parts.append(arch_context)
+
+    if is_group:
+        group_ops = cfg.group_owners.get(chat_id, [])
+        if group_ops:
+            op_names = [cfg.get_display_name(q, chat_id) for q in group_ops]
+            op_list = "、".join(f"{n}({q})" for n, q in zip(op_names, group_ops))
+            master_name = cfg.get_display_name(cfg.admin_qq)
+            extra_info_parts.append(
+                f"【主人提示】你的真正主人是{master_name}，"
+                f"同时{op_list}也在这个群拥有主人权限。对他们要用对主人一样的语气和态度。"
+            )
+
+    # ★ 2026-10-04: 说话人在「看屏幕授权名单」里且带身份标注 → 注入一句称呼提示。
+    #   刻意**不写进全局笔记本**：只在**这个人本人说话的那一刻**出现，
+    #   不会扩散到别的群，也不会变成机器人的"通用知识"（用户明确要这种范围）。
+    try:
+        from modules.screen import viewer_label as _viewer_label
+        _who = _viewer_label(user_id)
+        if _who and int(user_id) != int(getattr(cfg, "admin_qq", 0) or 0):
+            logger.info("注入说话人身份: %s(%s) → 你的%s", display_name, user_id, _who)
+            extra_info_parts.append(
+                f"【说话人身份】现在跟你说话的 {display_name}（QQ {user_id}）是你的{_who}。"
+                f"回答时可以自然称呼，但别刻意强调这层关系。"
+            )
+    except Exception:
+        pass
+
+    try:
+        from modules.op import get_mode, get_sleep_prompt_rule, get_narrative_prompt_rule
+        mode = get_mode()
+        if mode == "sleeping":
+            extra_info_parts.append(get_sleep_prompt_rule(chat_id))
+        elif mode == "narrative":
+            extra_info_parts.append(get_narrative_prompt_rule())
+    except ImportError:
+        pass
+
+    extra_info = "\n".join(extra_info_parts)
+
+    # ── 用户画像注入 ──
+    #   v2.3.34: 画像按 (会话, 用户) 分域 —— 群里和私聊各一份，
+    #   所以要把 chat_id / is_group 传进去（旧版只传 user_id，等于全局一份）
+    try:
+        from core.user_profile import build_profile_text
+        profile_text = build_profile_text(chat_id, user_id, is_group)
+        if profile_text:
+            extra_info += f"\n\n{profile_text}"
+    except ImportError:
+        pass
+
+    if extra_info:
+        logger.info("额外信息: 记忆=%d字 搜索=%d字", len(related_memories), 0)
+
+    # ------错误报告处理------
+    if error_report:
+        logger.info("🔧 检测到错误报告，临时隔离上下文...")
+        from modules.error_report import build_error_report_prompt
+        full_msg = build_error_report_prompt(sender_name=sender_name, log_content=error_report, original_msg=msg_content)
+        msg_history_for_llm = []
+        extra_info_for_llm = ""
+        ctx.append_to_context(chat_id, f"[错误报告] {sender_name} 上传了 Minecraft 错误报告，请求分析")
+        logger.info("🔧 上下文已隔离（旧上下文保留，LLM 调用暂不使用）")
+    else:
+        msg_history_for_llm = ctx.get_context(chat_id)
+        extra_info_for_llm = extra_info
+
+    # ------系统提示词+工具代理------
+    # cfg.system_prompt 结构: # 核心人格\n{core}\n---\n# 侧面人格\n{side}\n---\n# 固定身份\n{identity}\n---\n{self_awareness}
+    # persona 注入策略（全替换模式）：
+    #   - per-user persona dict {core, side, identity} 非空 → JSON 编码后用 PERSONA::: 标记，
+    #     _build_system_text 检测到后用三段构造 header，禁用 face_lib/private_tone/play_mode
+    #   - 保留 format_rules/command_tools/fav/anti_repeat（功能段）
+    #   - 同步设置记忆 override：私聊有 persona 时用专属记忆文件
+    #   - 无 per-user persona 时回退 [private_persona] 基底，再回退默认
+    system_prompt_for_llm = cfg.system_prompt
+    if not is_group:
+        try:
+            from modules.op import get_persona, get_persona_memory_id
+            from modules.memory import set_persona_override
+            custom = get_persona(user_id, cfg.private_persona_version)
+            if custom:
+                # 设置记忆覆盖（persona 专属记忆文件）
+                memory_id = get_persona_memory_id(user_id)
+                set_persona_override(user_id, memory_id)
+                # persona JSON 编码后用 PERSONA::: 标记注入
+                import json as _json
+                persona_json = _json.dumps(custom, ensure_ascii=False)
+                system_prompt_for_llm = f"PERSONA:::{persona_json}:::{cfg.system_prompt}"
+                logger.debug("私聊人格注入(全替换) [%d]: core=%s...", user_id, custom.get("core", "")[:40])
+            else:
+                # 无 persona：清除记忆覆盖
+                set_persona_override(user_id, None)
+                if cfg.private_persona_core or cfg.private_identity:
+                    # 全局 [private_persona] 基底：替换 core/side/identity，保留 self_awareness
+                    private_core = cfg.private_persona_core or cfg.personality_core
+                    parts = [f"# 核心人格\n{private_core}"]
+                    if cfg.private_persona_side:
+                        parts.append(f"# 侧面人格\n{cfg.private_persona_side}")
+                    ident = cfg.private_identity or cfg.identity
+                    parts.append(f"# 固定身份\n{ident}")
+                    parts.append(cfg._build_self_awareness())
+                    system_prompt_for_llm = "\n---\n".join(parts)
+                    logger.debug("私聊使用 [private_persona] 基底")
+        except ImportError:
+            pass
+
+    # 工具预选/执行代理已删除：inject_tool_system / try_tool_select / get_tool_status
+    # 三个函数在 core/tools.py 中不存在，ImportError 被静默吞掉，整段是死代码。
+    # 工具选择/执行由 generate_multi_reply_with_tools 中的 FC Agent 全权处理。
+
+    # ------Agent写作路由------
+    try:
+        from utils.writing import is_writing_request, generate_and_send_file
+        if await is_writing_request(msg_content, msg_history_for_llm):
+            logger.info("写作请求检测: from=%s", sender_name)
+            handled = await generate_and_send_file(
+                msg=full_msg if not is_group else msg_content,
+                msg_history=msg_history_for_llm,
+                speaker_name=sender_name,
+                chat_id=chat_id,
+                is_group=is_group,
+                user_id=user_id,
+            )
+            if handled:
+                logger.info("写作管道处理完成: chat=%d", chat_id)
+                return
+            logger.info("写作管道回退 → 走正常生成")
+    except ImportError:
+        pass
+
+    # ------编程路由（长代码题直接走 write_code，不经过 FC）------
+    import re as _re
+    _CODE_HINTS = [
+        r"使用\s*c\+\+", r"编程解决", r"写(个|代码|程序).*题",
+        r"编写程序", r"#include", r"\.cpp", r"交互题",
+        r"时间复杂度", r"std::", r"using namespace",
+    ]
+    _code_detected = any(_re.search(p, msg_content) for p in _CODE_HINTS)
+    if _code_detected and len(msg_content) > 500:
+        # 太长的题直接认怂，16岁看不懂
+        if len(msg_content) > 2000:
+            logger.info("编程请求过长 %d字，认怂", len(msg_content))
+            from services.sender import send_group_msg, send_private_msg
+            msg = "呜…这题好难喵，我看不懂~( ＞﹏＜ )"
+            if is_group:
+                await send_group_msg(msg, chat_id)
+            else:
+                await send_private_msg(msg, user_id)
+            return
+        logger.info("编程请求检测: from=%s len=%d → 走代码生成管道", sender_name, len(msg_content))
+        try:
+            from core.tools import _write_code
+            lang = "c++" if any(k in msg_content.lower() for k in ("c++", "cpp", "#include")) else "python"
+            if "javascript" in msg_content.lower() or "js" in msg_content.lower():
+                lang = "javascript"
+            result = await _write_code(
+                language=lang, description=msg_content[:3000],
+                user_id=user_id, group_id=chat_id, sender_name=sender_name,
+                is_group=is_group, bot_qq=bot_qq,
+            )
+            logger.info("代码生成管道完成: chat=%d result=%s", chat_id, result[:80])
+            return
+        except Exception as e:
+            logger.warning("代码生成管道失败: %s，回退正常生成", e)
+
+    # ------JSON LLM生成------
+    logger.info("开始生成回复: speaker=%s chat=%d (判断后已耗时%.2fs)",
+                display_name, chat_id, _tm.monotonic() - _t_pipe_start)
+    # v2.1.10: 前置思考判断 —— 复用 _detect_skill_needs 的 deep 意图
+    # ★★ 2026-10-01 修正，勿改回 `thinking = False` ★★
+    #   原来这里是 `thinking = False`（闲聊/指令一律关思考，为省 token 和延迟）。
+    #   实测这会**破坏回复格式**：关掉思考时模型会退化成纯文本散文、丢掉 JSON 帧，
+    #   于是走 _salvage_plain_reply —— 那里 fav 硬编码 0、根本没有 mood 字段，
+    #   导致**好感度与心情长期静默失效**；同时模型也不会写 [FACE:xxx]，
+    #   导致**表情包永远发不出去**（两者是同一个根因）。
+    #   实测对照（同一输入 + 真实历史，只改 thinking）：
+    #     False → 非 JSON，fav=+0，无 [FACE:]
+    #     None  → JSON，fav=+1 mood=开心，含 [FACE:招呼]
+    #     True  → JSON，fav=+1 mood=开心，含 [FACE:开心]
+    #   故改为：deep 命中的长问题显式开启；其余跟随 API 默认（本模型默认即开启）。
+    #   代价：每次回复慢约 1.5s、多花 reasoning token —— 换格式与功能正确，值得。
+    thinking = None
+    try:
+        from services.llm import _detect_skill_needs
+        needs = _detect_skill_needs(full_msg, is_group)
+        if "deep" in needs:
+            thinking = True
+        logger.info("思考模式: %s (needs=%s)",
+                    "开启" if thinking else "跟随API默认(开启)", sorted(needs))
+    except Exception as e:
+        logger.warning("思考判断失败，改为跟随 API 默认: %s", e)
+    # v2.1.12: [已思考N秒] 共享状态——LLM 思考完成后由回调记录时长，
+    # 先导语（FC轮1）或主回复首句消费并置 applied，只展示一次
+    thought_ctx: dict = {"secs": None, "applied": False}
+    # ★ v2.3.23: 记录已发出的先导语，用于主回复去重（防隔十几秒重复同一句）
+    sent_lead: list[str] = []
+    # 报错上报用起点：失败时只认这之后产生的错误记录，
+    # 避免把上一轮/别的群遗留的旧错误当成这次的报错（全局只存最近一条）
+    _llm_err_since = _tm.time()
+    sentences, fav_change, llm_calls, face_cq, mood, mood_detail, action, at_qq, mode_switch, origin, actor, _ = await generate_multi_reply_with_tools(
+        msg_history=msg_history_for_llm, speaker_name=display_name, current_msg=full_msg,
+        bot_name=cfg.bot_name, system_prompt=system_prompt_for_llm, reply_model=cfg.reply_model,
+        is_group=is_group, extra_info=extra_info_for_llm,
+        max_tokens=None,
+        user_id=user_id, group_id=chat_id if is_group else 0, bot_qq=bot_qq,
+        interim_cb=_make_interim_sender(chat_id, is_group, user_id, thought_ctx, sent_lead),
+        thinking=thinking,
+        thought_shown_cb=_make_thought_cb(thought_ctx),
+    )
+    logger.debug("PIPE LLM生成完成 耗时%.2fs → %d句 (total %.2fs)",
+                 _tm.monotonic() - _t_pipe_start, len(sentences) if sentences else 0,
+                 _tm.monotonic() - _t_pipe_start)
+
+    if not sentences:
+        # ★ 2026-09-29 用户要求：报错要能说清"是什么问题"，并把整个报错栈发出来。
+        #   原先是写死的「错误: LLM返回空内容」—— 调用的真实失败原因被吞在 llm.py 里，
+        #   聊天里看到的永远是同一句，排查全靠登服务器翻日志。
+        #   format_llm_error(since=...) 只认本次调用之后产生的错误，避免旧错误串场。
+        from services.llm import format_llm_error
+        _err_detail = format_llm_error(since=_llm_err_since)
+        error_lines = [
+            "呜呜，回复生成失败了喵~",
+            _err_detail or ("错误: 模型返回空内容（本次没捕获到异常 —— "
+                            "多为空返回/JSON 解析失败，服务器日志有原文）"),
+            f"时间: {now.strftime('%H:%M:%S')}",
+            f"对话者: {display_name}",
+            f"上下文: {len(msg_history_for_llm)}轮",
+            # v2.1.17: 不再硬编码管理员名字（换部署会 @ 错人），改为配置里的 admin QQ
+            f"请联系管理员 @{cfg.admin_qq} 解决喵~",
+        ]
+        await send_by_chat_type("\n".join(error_lines), chat_id if is_group else chat_id,
+                               is_group=True if is_group else False,
+                               user_id=user_id if not is_group else None)
+        logger.warning("LLM 未返回有效句子，已发送失败提示")
+        return
+
+    # ------垃圾过滤------
+    _ctx_pattern = re.compile(r'^\[(admin|friend|群友)\]\s+\S+:\s')
+    filtered = []
+    for s in sentences:
+        if _ctx_pattern.match(s):
+            logger.warning("LLM 回显上下文格式，已过滤: '%s'", s[:60])
+            continue
+        filtered.append(s)
+    if not filtered:
+        filtered.append(format_lang("bot.fallback_reply", name=cfg.bot_name))
+    # ★ v2.3.23: 先导语去重——FC 轮1 已把开场白先发给用户，最终回复若又写一遍
+    #   （实测同一句隔 18s 发两次）在这里丢掉，避免用户看到复读
+    filtered = _dedup_against_lead(filtered, sent_lead)
+    sentences = filtered
+    sentences = [_clean_reply(s) for s in sentences]
+
+    # actor 始终以真实发送者为准，不信任 LLM 输出
+    if origin == "user" and (not actor or actor.get("qq") != user_id):
+        actor = {"name": display_name, "qq": user_id}
+
+    # ------FILE文件处理------
+    _file_re = re.compile(r'\[FILE:(.+?)\](.*?)\[/FILE\]', re.DOTALL)
+    for i, s in enumerate(sentences):
+        m = _file_re.search(s)
+        if m:
+            fname = m.group(1).strip()
+            content = m.group(2).strip()
+            if not fname.endswith('.txt'):
+                fname += '.txt'
+            import tempfile
+            fpath = Path(tempfile.gettempdir()) / fname
+            fpath.write_text(content, encoding='utf-8')
+            logger.info("[FILE] 创建: %s (%d字)", fname, len(content))
+            fpath_str = str(fpath).replace('\\', '/')
+            sentences[i] = f"[CQ:file,file=file:///{fpath_str},name={fname}]"
+            async def _clean():
+                await asyncio.sleep(30)
+                try: fpath.unlink()
+                except: pass
+            asyncio.create_task(_clean())
+
+    # ------清理回复正文里的指令语法（只清理，不执行）------
+    # v2.1.17 用户要求：replies 就应该是正常文本，指令出现在正文里不该被触发。
+    # 数据支持这个决定（近 7 天日志统计）：
+    #   · 「从回复中自动提取CALL」只命中 1 次，且是误伤——"400tok/s 都快赶上本地推理了"
+    #     里的 /s 被当成 search 别名，白跑一次 28s 搜索（v2.2.1 记录在案）
+    #   · 同期 `calls` 字段正常工作 21 次（note 11 / search_web 4 / draw / wdsj …）
+    # 也就是说扫描执行换不来收益，只留下误触发风险。现在改为：把指令语法从正文里清掉
+    # （保证用户看不到 /~xxx 这种乱码），但**绝不执行**；要执行只能走 JSON 的 calls 字段
+    # （由 _parse_reply 解析，交给下面的「CALL执行」段）。
+    if sentences:
+        _cmd_re = _re.compile(r'/(?:\~|\#)\s*(\w+)(?:\s+\[?([^\]]*)\]?)?')
+        _new_lines = []
+        for _line in sentences:
+            _line = str(_line) if _line else ""
+            _found = _cmd_re.findall(_line)
+            if _found:
+                logger.warning("回复正文含指令语法，已清理（不执行）: %s | 行: %s",
+                               [f"/~{n}" for n, _ in _found][:3], _line[:60])
+                _line = _cmd_re.sub("", _line).strip()
+                if not _line:
+                    continue
+            _new_lines.append(_line)
+        sentences = _new_lines
+
+    # ------CALL执行------
+    # ★ v2.3.46: 交错执行 —— LLM 在 replies 里混入 {"cmd":...} 项时
+    #   （解析层已转成 calls + _after=前面文本句数），按用户可见顺序执行：
+    #   文本1 → 指令(输出发群里) → 文本2 …
+    #   全部 call 都没有 _after 时走原路径，行为与旧版完全一致。
+    _interleaved = any(isinstance(c, dict) and "_after" in c for c in (llm_calls or []))
+    _flow_calls: list = []   # 交错模式：解析好的调用（含 caller 归属与插入位置）
+    executed_calls = []
+    call_results = []
+    call_texts = []  # 延迟执行的发文件类 CALL
+    if llm_calls and not _interleaved:
+        for call in llm_calls:
+            if not isinstance(call, dict):
+                continue
+            cmd_name = str(call.get("name", "")).strip().lstrip("~")
+            cmd_args = str(call.get("args", "")).strip()
+            if not cmd_name:
+                continue
+            from modules.commands import COMMAND_MAP
+            if cmd_name not in COMMAND_MAP:
+                err_msg = f"指令 /~{cmd_name} 不存在喵~\n请联系管理员 @{cfg.admin_qq}"
+                await send_by_chat_type(err_msg, chat_id if is_group else chat_id,
+                                       is_group=True, user_id=None)
+                logger.warning("JSON CALL 无效: %s", cmd_name)
+                continue
+            # 追踪：有人叫bot执行 → 用actor的QQ；bot自己执行 → 用bot_qq
+            caller_id = user_id
+            caller_name = display_name
+            if isinstance(actor, dict) and actor.get("qq"):
+                caller_id = int(actor["qq"])
+                caller_name = actor.get("name", display_name)
+            elif origin == "bot":
+                caller_id = bot_qq
+                caller_name = cfg.bot_name
+
+            call_text = f"/~{cmd_name} {cmd_args}".strip()
+            logger.info("JSON CALL: %s (by=%s origin=%s)", call_text, caller_name, origin)
+            # write_code 类发文件指令延迟执行，等文字先发送
+            _send_file_cmds = ("write_code",)
+            if cmd_name in _send_file_cmds:
+                call_results.append(None)  # 占位，稍后填充
+                call_texts.append((call_text, len(call_results) - 1, caller_id, caller_name))
+            else:
+                try:
+                    result = await handle_command(call_text, caller_id, chat_id, caller_name, is_group, bot_qq, raw_message)
+                    call_results.append(result)
+                except Exception as e:
+                    logger.warning("JSON CALL执行失败 [%s]: %s", cmd_name, e)
+                    err_msg = f"指令 /~{cmd_name} 执行失败喵~\n错误: {str(e)[:200]}\n请联系管理员 @{cfg.admin_qq}"
+                    await send_by_chat_type(err_msg, chat_id if is_group else chat_id,
+                                           is_group=True, user_id=None)
+                    call_results.append(f"[CALL错误] {e}")
+            executed_calls.append((cmd_name, cmd_args))
+    elif llm_calls and _interleaved:
+        # 交错模式：此处只做 caller 归属与位置解析，真正执行推迟到发送时间线
+        from modules.commands import COMMAND_MAP as _CM
+        for call in llm_calls:
+            if not isinstance(call, dict):
+                continue
+            cmd_name = str(call.get("name", "")).strip().lstrip("~")
+            cmd_args = str(call.get("args", "")).strip()
+            if not cmd_name:
+                continue
+            caller_id = user_id
+            caller_name = display_name
+            if isinstance(actor, dict) and actor.get("qq"):
+                caller_id = int(actor["qq"])
+                caller_name = actor.get("name", display_name)
+            elif origin == "bot":
+                caller_id = bot_qq
+                caller_name = cfg.bot_name
+            _flow_calls.append({
+                "name": cmd_name,
+                "args": cmd_args,
+                "valid": cmd_name in _CM,
+                "after": max(0, min(int(call.get("_after") or 0), 10 ** 6)),
+                "caller_id": caller_id,
+                "caller_name": caller_name,
+            })
+            executed_calls.append((cmd_name, cmd_args))
+        logger.info("交错回复: %d句 + %d个穿插指令 at=%s",
+                    len(sentences), len(_flow_calls),
+                    [fc["after"] for fc in _flow_calls])
+
+    is_at_me = raw_message and f"[CQ:at,qq={bot_qq}]" in raw_message
+    combined_reply = " || ".join(sentences)
+    if executed_calls and is_group and is_at_me:
+        first_call_idx = -1
+        for i, s in enumerate(sentences):
+            if re.search(r'\[CALL:', s):
+                first_call_idx = i
+                break
+        if first_call_idx > 0:
+            logger.debug("丢弃 CALL 前的 %d 句闲聊（@优先）", first_call_idx)
+            sentences = sentences[first_call_idx:]
+
+    combined_reply = re.sub(r'\[CALL:[^\]]+\]', '', combined_reply).strip()
+    if executed_calls:
+        hints = []
+        for c in set(name for name, _ in executed_calls):
+            hints.append(c)
+        call_hint = "、".join(hints)
+        logger.info("CALL执行: %s", call_hint)
+        ctx.append_to_context(chat_id, f"[系统] 已调用: {call_hint}")
+
+    # ------表情处理（v2.1.19：受测试项 face_inline 控制）------
+    # 【新行为 · face_inline 开启】replies 每一句都能带自己的 [FACE:关键词]，
+    #   发送时按「文字 → 该句的图 → 文字 → 图」交错，表情包成为情绪节拍。
+    # 【默认行为 · face_inline 关闭】整条回复至多 1 个表情（JSON 的 face 字段），
+    #   且发在所有文字之后（历史行为）。用 /~key face_inline off 可随时回退。
+    sentences = [s for s in combined_reply.split(" || ") if s.strip()]
+    if not sentences:
+        sentences = ["喵~"]
+
+    try:
+        from modules.features import is_enabled as _feat_on
+        _face_inline_on = _feat_on("face_inline")
+    except Exception:
+        _face_inline_on = True   # 开关模块异常时保持新行为（与注册表默认一致）
+
+    _faces_per_sentence: list[str | None] = []
+    _inline_face_count = 0
+
+    if not _face_inline_on:
+        # ── 默认行为：清理内联标记，仅保留 JSON face 字段，发在所有文字之后 ──
+        _face_re_off = _re.compile(r'\[FACE:[^\]]*\]?')
+        sentences = [(_face_re_off.sub("", s).strip() or "") for s in sentences]
+        sentences = [s for s in sentences if s]
+        if not sentences:
+            sentences = ["喵~"]
+        _faces_per_sentence = [None] * len(sentences)
+        logger.debug("逐句配图已关闭（/~key face_inline），走默认表情行为")
+    else:
+        # ── 新行为：逐句提取 [FACE:关键词]，构建与 sentences 等长的配图列表 ──
+        _face_re = _re.compile(r'\[FACE:([^\]]*)\]?')
+        _clean_sentences: list[str] = []
+        for _s in sentences:
+            _kws = [k.strip() for k in _face_re.findall(_s) if k.strip()]
+            # 去掉标记，保留纯文本
+            _txt = _face_re.sub("", _s).strip()
+            _cq = None
+            if _kws:
+                try:
+                    from modules.face_lib import get_face, make_cq
+                    for _kw in _kws:
+                        _fp = get_face(_kw)
+                        if _fp:
+                            _cq = make_cq(_fp)
+                            _inline_face_count += 1
+                            # ★ v2.3.21: 解析到表情文件即打日志（文件名可从 CQ:image 提取）
+                            _fname = _fp.replace("\\", "/").split("/")[-1]
+                            logger.info("表情匹配: 关键词=%s → %s", _kw, _fname)
+                            break
+                        logger.debug("表情库未匹配关键词: %s", _kw)
+                except Exception:
+                    logger.warning("表情解析失败: %s", _kws, exc_info=True)
+            # 纯表情句（没有文字）也要保留，否则这一拍会丢
+            if not _txt and not _cq:
+                continue
+            _clean_sentences.append(_txt)
+            _faces_per_sentence.append(_cq)
+
+        sentences = _clean_sentences
+        if not sentences:
+            sentences = ["喵~"]
+            _faces_per_sentence = [None]
+
+    # 兼容旧的单表情字段：只有当正文里没有任何内联表情时才用它，
+    # 挂在最后一句上（等价于历史行为），避免与内联表情重复发图。
+    if face_cq and _inline_face_count == 0:
+        _faces_per_sentence[-1] = face_cq
+        # ★ v2.3.21: JSON face 字段单表情路径也打日志（文件在 _parse_reply 里已生成）
+        _m = re.search(r'file=([^,\]]+)', face_cq or "")
+        _fname = (_m.group(1).split("/")[-1] if _m else "") or face_cq[:40]
+        logger.info("表情匹配: JSON face 字段 → %s", _fname)
+        logger.debug("使用 JSON face 字段（末句配图）")
+    if _inline_face_count:
+        logger.info("逐句配图: 正文内联 %d 张 / 共 %d 句", _inline_face_count, len(sentences))
+
+    # ── 群聊表情包：v2.3.9 起恢复正常发送（用户要求"表情包要常发"）──
+    #   历史：v2.3.6 曾加过"群聊一律拦截表情、改用括号动作"的硬兜底，属误判
+    #   （用户并未要求禁表情）——已移除。群聊与私聊一致，按 _faces_per_sentence 交错发送。
+
+    # ------上下文回写------
+    # ★★ 绝对不要用 " || " 拼接！这条会被写进 LLM 上下文历史，而历史是模型的
+    #    最强示范：它看到自己过去全是 "句1 || 句2 || 句3"，就会模仿这个格式、
+    #    无视 system 里反复强调的 JSON 要求 → 主回复走 salvage 救回路径
+    #    （_salvage_plain_reply 里 fav 硬编码 0、mood 字段丢失）→ 好感度与心情
+    #    长期静默失效。且新回复又以 " || " 写回历史 → 自我强化、越陷越深。
+    #    改用自然标点"、"，只表达"这是一串连续说的话"，不构成可模仿的格式范例。
+    _context_reply = re.sub(r'\s*\[系统\]\s*已调用:\s*\S+', '', "，".join(sentences)).strip()
+    # ★ CQ 码简化写入上下文（避免 [CQ:image,file=...] 污染 LLM 上下文）
+    _context_reply = re.sub(r'\[CQ:image[^\]]*\]', '[图片]', _context_reply)
+    _context_reply = re.sub(r'\[CQ:face[^\]]*\]', '[表情]', _context_reply)
+    _context_reply = re.sub(r'\[CQ:at[^\]]*\]', '@', _context_reply)
+    _context_reply = re.sub(r'\[CQ:[^\]]*\]', '[消息]', _context_reply)
+    ctx.append_to_context(chat_id, f"{cfg.bot_name}: {_context_reply}")
+
+    for s in sentences:
+        _s_clean = re.sub(r'\s*\[系统\]\s*已调用:\s*\S+', '', s).strip()
+        if _s_clean:
+            ctx.append_to_buffer(chat_id, f"{cfg.bot_name}: {_s_clean}")
+
+    # ------action动作------
+    if action:
+        action_text = f"({action})"
+        if sentences:
+            sentences[-1] = sentences[-1] + action_text
+        else:
+            sentences.append(action_text)
+
+    # ------@处理：把 @QQ号 替换为 [CQ:at]------
+    if at_qq and is_group:
+        at_cq = f"[CQ:at,qq={at_qq}]"
+        at_text = f"@{at_qq}"
+        for i in range(len(sentences)):
+            sentences[i] = sentences[i].replace(at_text, at_cq)
+
+    # ------mode切换------
+    if mode_switch and mode_switch in ("normal", "sleeping", "narrative"):
+        try:
+            from modules.op import _load_modes, _save_modes
+            modes = _load_modes()
+            if mode_switch == "normal":
+                modes.pop(str(chat_id), None)
+            else:
+                modes[str(chat_id)] = {"mode": mode_switch, "since": __import__("time").time()}
+            _save_modes(modes)
+            logger.info("LLM主动切换模式: chat=%d → %s", chat_id, mode_switch)
+        except Exception:
+            pass
+
+    # ------插件管道后钩子（on_reply）------
+    _post_hooks = get_pipeline_hooks().all_post_hooks()
+    if _post_hooks and sentences:
+        _msg_dict = {
+            "msg_type": msg_type, "msg_content": msg_content,
+            "chat_id": chat_id, "sender_name": sender_name,
+            "user_id": user_id, "is_group": is_group,
+            "bot_qq": bot_qq, "raw_message": raw_message,
+            "quoted_msg": quoted_msg,
+        }
+        _filtered = []
+        for s in sentences:
+            for hook in _post_hooks:
+                try:
+                    # ★ v2.0.4r: 单 hook 10s 超时
+                    modified = await asyncio.wait_for(hook(s, _msg_dict), timeout=10.0)
+                    if modified is None:
+                        continue
+                    if modified == "":
+                        s = None
+                        break
+                    s = modified
+                except asyncio.TimeoutError:
+                    logger.warning("插件 post-hook 超时跳过: %s", getattr(hook, "__name__", hook))
+                except Exception:
+                    pass
+            if s is not None:
+                _filtered.append(s)
+        sentences = _filtered
+
+    if not sentences:
+        logger.info("插件后钩子拦截了全部回复 [chat=%d]", chat_id)
+        return
+
+    # ------发送------
+    # ★ v2.2.1: 纯 note 操作时回复裁到 1 句。
+    #   实测 LLM 常在「好，记本子上了～」后面多带一句评论群里其他话题的话（串台），
+    #   例：别人在聊军训出汗 → 顺嘴点评军训。规则已写进 fmt_reminder，这里做硬保护。
+    #   与下面「纯 note 不触发追加回复」(_note_only) 同源，都是 note 专属的静默处理。
+    if executed_calls and all(name == "note" for name, _ in executed_calls) and len(sentences) > 1:
+        logger.info("note 专用回复裁到 1 句（原 %d 句），丢弃: %s",
+                    len(sentences), [s[:30] for s in sentences[1:]])
+        sentences = sentences[:1]
+
+    old_task = ctx.cancel_old_task(chat_id)
+    if old_task:
+        logger.debug("取消旧发送任务 chat=%d", chat_id)
+
+    # 工具调用通知 → 追加到最后
+    # ★ 这是**有意设计**（用户 2026-09-14 明确说明）：把 bot 调用了哪个指令作为一条
+    #   消息发给用户看，效果类似"展示工具调用"。
+    #   ⚠️ 不要当调试残留删掉！曾误判为泄漏并删除，被用户纠正后已恢复。
+    if executed_calls and not _interleaved:
+        call_hints = []
+        for name, args_str in executed_calls:
+            _a = (args_str or "").strip()
+            # args 为空时不留尾空格（原来会拼出 "[工具调用: reward ]"）
+            call_hints.append(f"[工具调用: {name}{' ' + _a if _a else ''}]")
+        sentences.append("\n".join(call_hints))
+
+    # v2.1.12: 主回复首句 + [已思考N秒]（先导语未挂过才挂，且思考时长满足阈值）
+    # v2.1.18: 移到 create_task **之前**——原来在任务创建后才改 sentences，
+    #   依赖"协程还没跑起来"这个巧合；现在 faces 与 sentences 必须下标对齐，
+    #   插入新句就必须同步插入占位，顺序错了会导致配图错位。
+    if thought_ctx.get("secs") and not thought_ctx.get("applied") and sentences:
+        prefix = f"[已思考{thought_ctx['secs']}秒] "
+        # 首句本身已是前缀/Markdown 标题/文件卡片 → 前缀独立成句，避免粘连
+        if sentences[0].lstrip().startswith(("[", "#", "`")):
+            sentences.insert(0, prefix.rstrip())
+            _faces_per_sentence.insert(0, None)
+        else:
+            sentences[0] = prefix + sentences[0]
+        thought_ctx["applied"] = True
+        logger.info("主回复前置 [已思考%d秒]", thought_ctx["secs"])
+
+    # ------发送------
+    # ★ v2.3.46 交错模式：文本与指令按时间线顺序执行
+    #   （文本用 send_sentences 原样发；指令执行后输出就地发群里）
+    async def _exec_flow_call(fc) -> object:
+        """执行单个 JSON CALL 并按结果类型就地发送。返回原始结果。"""
+        cmd_text = f"/~{fc['name']} {fc['args']}".strip()
+        logger.info("JSON CALL(交错): %s (by=%s)", cmd_text, fc["caller_name"])
+        # ★ v2.3.47: 工具调用提示与指令执行**同时**发出（原来统一堆在末尾，
+        #   和指令输出脱节——用户 2026-09-18 12:35 明确要求同步）
+        _a = (fc["args"] or "").strip()
+        await send_by_chat_type(
+            f"[工具调用: {fc['name']}{' ' + _a if _a else ''}]",
+            chat_id, is_group=is_group,
+            user_id=user_id if not is_group else None)
+        if not fc.get("valid"):
+            err_msg = f"指令 /~{fc['name']} 不存在喵~\n请联系管理员 @{cfg.admin_qq}"
+            await send_by_chat_type(err_msg, chat_id, is_group=is_group,
+                                    user_id=user_id if not is_group else None)
+            return "[CALL错误] 指令不存在"
+        try:
+            result = await handle_command(cmd_text, fc["caller_id"], chat_id,
+                                          fc["caller_name"], is_group, bot_qq, raw_message)
+        except Exception as e:
+            logger.warning("交错CALL执行失败 [%s]: %s", fc["name"], e)
+            err_msg = f"指令 /~{fc['name']} 执行失败喵~\n错误: {str(e)[:200]}\n请联系管理员 @{cfg.admin_qq}"
+            await send_by_chat_type(err_msg, chat_id, is_group=is_group,
+                                    user_id=user_id if not is_group else None)
+            return f"[CALL错误] {e}"
+        if not result:
+            return result
+        if isinstance(result, str) and result.startswith("__EQ_CARD__:"):
+            png = result.split(":", 1)[1]
+            cq = f"[CQ:image,file=file:///{png.replace(chr(92), '/')}]"
+            await send_by_chat_type(cq, chat_id, is_group=is_group,
+                                    user_id=user_id if not is_group else None)
+        elif isinstance(result, str) and "[CQ:image" in result:
+            # ★ v2.3.6 规则沿用：结果自带图 → 原样直发（转述必丢 CQ 码）
+            await send_by_chat_type(result, chat_id, is_group=is_group,
+                                    user_id=user_id if not is_group else None)
+        elif fc["name"] in ("write_code", "note"):
+            # write_code 的文件由指令自身发送；note 静默（首轮已说"记下了"）
+            pass
+        elif fc["name"] in ("search", "read"):
+            # 搜索结果太 raw，不直发 → 交给流程末尾的 LLM 转述
+            pass
+        else:
+            await send_by_chat_type(result, chat_id, is_group=is_group,
+                                    user_id=user_id if not is_group else None)
+        return result
+
+    if _interleaved and _flow_calls:
+        _by_pos: dict = {}
+        for fc in _flow_calls:
+            _by_pos.setdefault(min(fc["after"], len(sentences)), []).append(fc)
+        _search_results: list = []   # 搜索类结果留到末尾转述
+
+        async def _run_flow():
+            _idx = 0
+            for pos in sorted(set(list(_by_pos.keys()) + [len(sentences)])):
+                if pos > _idx:
+                    await send_sentences(sentences[_idx:pos], chat_id, is_group,
+                                         user_id=user_id if not is_group else None,
+                                         faces=_faces_per_sentence[_idx:pos])
+                    _idx = pos
+                for fc in _by_pos.get(pos, []):
+                    res = await _exec_flow_call(fc)
+                    call_results.append(res)
+                    # ★ 指令输出写回上下文——模型后续说话才有真实数据可依，
+                    #   否则又会像 11:31 那样编"150瓦3.6度"（起因正是这个）
+                    if res and not str(res).startswith("[CALL错误]") and fc["name"] not in ("write_code", "note"):
+                        ctx.append_to_context(chat_id, f"[系统] 调用结果: {_ctx_safe(str(res)[:200])}")
+                    if fc["name"] in ("search", "read") and res and not str(res).startswith("[CALL错误]"):
+                        _search_results.append((fc, res))
+            if _idx < len(sentences):
+                await send_sentences(sentences[_idx:], chat_id, is_group,
+                                     user_id=user_id if not is_group else None,
+                                     faces=_faces_per_sentence[_idx:])
+            # 工具调用提示已随各指令就地发出（v2.3.47），不再统一堆末尾
+            # 搜索类结果 → LLM 转述（与旧路径同一 prompt 风格）
+            if _search_results:
+                _fc0, _res0 = _search_results[0]
+                ctx.append_to_context(chat_id, f"[系统] 调用结果: {_ctx_safe(str(_res0)[:200])}")
+                try:
+                    from services.llm import call_llm as raw_llm, _build_system_text
+                    follow_sys = _build_system_text(cfg.bot_name, cfg.system_prompt, is_group)
+                    follow = await raw_llm(cfg.reply_model, [
+                        {"role": "system", "content": follow_sys},
+                        {"role": "user", "content": (
+                            "你刚才搜索了以下内容。输出严格按照 cfg.reply_schema JSON 格式，"
+                            "包含 replies/fav/calls/face/mood/action 字段。\n"
+                            "replies 数组 4-8 句，每句讲一个事实要点，按时间顺序排列，讲透为止。\n"
+                            "用你的正常语气和人设回复。\n"
+                            f"搜索结果:\n{str(_res0)[:4000]}"
+                        )},
+                    ], temperature=0.7, timeout=30.0)
+                    if follow and follow.strip():
+                        f_text = follow.strip()
+                        if f_text.startswith('{') and '"replies"' in f_text:
+                            try:
+                                import json as _json
+                                _p = _json.loads(f_text)
+                                for sentence in (_p.get("replies") or []):
+                                    sentence = str(sentence)[:3000].strip()
+                                    sentence, _fcq = extract_inline_face(sentence)
+                                    if sentence:
+                                        ctx.append_to_context(chat_id, _ctx_safe(f"{cfg.bot_name}: {sentence}", 200))
+                                        await send_by_chat_type(sentence, chat_id, is_group=is_group,
+                                                                user_id=user_id if not is_group else None)
+                                    if _fcq:
+                                        await send_by_chat_type(_fcq, chat_id, is_group=is_group,
+                                                                user_id=user_id if not is_group else None)
+                            except Exception:
+                                pass
+                except Exception as e:
+                    logger.warning("交错搜索转述失败: %s", e)
+
+        task = asyncio.create_task(_run_flow())
+        ctx.set_active_send_task(chat_id, task)
+    else:
+        task = asyncio.create_task(send_sentences(
+            sentences, chat_id, is_group,
+            user_id=user_id if not is_group else None,
+            faces=_faces_per_sentence,
+        ))
+        ctx.set_active_send_task(chat_id, task)
+
+    # ------CALL结果回发------
+    if call_results and not _interleaved:
+        async def _send_call_results():
+            await task
+            # 等待文字全部发出后，再执行发文件类 CALL
+            for call_text, idx, caller_id, caller_name in call_texts:
+                try:
+                    result = await handle_command(call_text, caller_id, chat_id, caller_name, is_group, bot_qq, raw_message)
+                    call_results[idx] = result
+                except Exception as e:
+                    logger.warning("延迟CALL执行失败: %s", e)
+                    call_results[idx] = f"[CALL错误] {e}"
+            is_search_or_read = any(name in ("search", "read") for name, _ in executed_calls)
+            for i, r in enumerate(call_results):
+                if not r:
+                    continue
+                if isinstance(r, str) and r.startswith("__EQ_CARD__:"):
+                    png = r.split(":", 1)[1]
+                    cq = f"[CQ:image,file=file:///{png.replace(chr(92), '/')}]"
+                    await send_by_chat_type(cq, chat_id if is_group else chat_id,
+                                           is_group=True if is_group else False,
+                                           user_id=user_id if not is_group else None)
+                elif not is_search_or_read:
+                    if isinstance(r, str) and r.startswith("[CALL错误]"):
+                        continue
+                    short = r[:200] + "..." if len(r) > 200 else r
+                    logger.info("CALL结果: %s", short[:80])
+
+            # ★ v2.3.6: 结果自带图片（如 /~赞赏 的赞赏码）→ 原样直发，不进 LLM 转述。
+            #   根因：转述必丢 CQ 码——LLM 不会把 [CQ:image,file=…] 原样吐回来，
+            #   它只会用自己的话描述。实测 2026-09-14 私聊要赞赏码：文字来了 8 条、
+            #   图一张没发（msglog 无含图记录，可复现）。
+            #   这与 __EQ_CARD__ 分支的区别：那个是「返回 PNG 路径」，这个是「返回文本里带 CQ」。
+            _cq_texts = [r for r in call_results
+                         if isinstance(r, str) and "[CQ:image" in r
+                         and not r.startswith("__EQ_CARD__:")]
+            if _cq_texts:
+                for r in _cq_texts:
+                    ctx.append_to_context(chat_id, f"[系统] 调用结果: {_ctx_safe(r)}")
+                    logger.info("CALL结果含图，直发（跳过 LLM 转述）: %s", r[:60])
+                    await send_by_chat_type(r, chat_id if is_group else chat_id,
+                                           is_group=True if is_group else False,
+                                           user_id=user_id if not is_group else None)
+                return
+
+            # ★ v2.1.1: 纯 note 调用不触发追加回复（首轮已说"记下了"，再回一次会重复）
+            _note_only = bool(executed_calls) and all(name == "note" for name, _ in executed_calls)
+            if call_results[0] and not _note_only:
+                effective_result = call_results[0]
+                is_call_error = isinstance(effective_result, str) and effective_result.startswith("[CALL错误]")
+                ctx_text = effective_result[:200] if not is_call_error else f"[执行失败] {effective_result[:200]}"
+                ctx.append_to_context(chat_id, f"[系统] 调用结果: {_ctx_safe(ctx_text)}")
+                try:
+                    from services.llm import call_llm as raw_llm, _build_system_text
+                    # ★ 私聊 follow-up 也要注入 persona（修复人设割裂：搜索后回复不能变回默认猫娘）
+                    custom_persona = None
+                    if not is_group:
+                        try:
+                            from modules.op import get_persona
+                            custom_persona = get_persona(user_id, cfg.private_persona_version)
+                        except ImportError:
+                            pass
+                    follow_sys = _build_system_text(cfg.bot_name, cfg.system_prompt, is_group,
+                                                    custom_persona=custom_persona)
+                    if is_search_or_read:
+                        # 保留人格 → 用主 system prompt，搜索结果当素材
+                        pass  # follow_sys 已带 persona（custom_persona 注入）
+                    if is_call_error:
+                        err_detail = effective_result.replace("[CALL错误]", "").strip()
+                        prompt = (
+                            "系统调用的功能执行失败，请诚实告知用户。\n"
+                            "规则：一句话简短告诉用户操作失败并给出正确用法提示，不要编造数据。\n"
+                            f"失败原因: {err_detail[:300]}"
+                        )
+                        max_t = 120
+                    elif is_search_or_read:
+                        prompt = (
+                            "你刚才搜索了以下内容。输出严格按照 cfg.reply_schema JSON 格式，包含 replies/fav/calls/face/mood/action 字段。\n"
+                            "replies 数组 4-8 句（内容多可到 10 句），每句讲一个事实要点，按时间顺序从早到晚排列，不要跳来跳去。讲透为止，别压缩成摘要。\n"
+                            "禁止每句都用'喵~'结尾，可以穿插波浪号~、感叹句、颜文字（＾ω＾）等让语气自然丰富。\n"
+                            "用你的正常语气和人设回复。\n"
+                            f"搜索结果:\n{effective_result[:4000]}"
+                        )
+                        max_t = None  # 不限 token
+                    else:
+                        prompt = (
+                            "上面是调用结果。简单数据一两句自然回应即可；如果结果含知识/原理/步骤/对比类内容，就展开讲清楚，不限句数。纯文本，不要JSON。\n"
+                            f"结果: {effective_result[:2000]}"
+                        )
+                        max_t = 1500
+                    follow = await raw_llm(cfg.reply_model, [
+                        {"role": "system", "content": follow_sys},
+                        {"role": "user", "content": prompt},
+                    ], max_tokens=max_t, temperature=0.7, timeout=15.0)
+                    if follow and follow.strip():
+                        f_text = follow.strip()
+                        # JSON 回复 → 解析并分段发送
+                        if f_text.startswith('{') and '"replies"' in f_text:
+                            try:
+                                import json
+                                parsed = json.loads(f_text)
+                                if isinstance(parsed, dict) and "replies" in parsed:
+                                    for sentence in parsed["replies"]:
+                                        sentence = sentence[:3000].strip()
+                                        # ★ v2.3.27: 剥掉 [FACE:关键词] 并改发真表情
+                                        #   （此前直接发原文 → "[FACE:疲惫]" 泄漏给用户）
+                                        sentence, _fcq = extract_inline_face(sentence)
+                                        if sentence:
+                                            ctx.append_to_context(chat_id, _ctx_safe(f"{cfg.bot_name}: {sentence}", 200))
+                                            await send_by_chat_type(sentence, chat_id if is_group else chat_id,
+                                                                   is_group=True if is_group else False,
+                                                                   user_id=user_id if not is_group else None)
+                                        if _fcq:
+                                            await send_by_chat_type(_fcq, chat_id if is_group else chat_id,
+                                                                   is_group=True if is_group else False,
+                                                                   user_id=user_id if not is_group else None)
+                                    return  # 已处理，跳过下面
+                                else:
+                                    f_text = str(parsed)
+                            except Exception:
+                                pass
+                        # 纯文本回退
+                        f_text = f_text[:3000]
+                        f_text = re.sub(r'[\[［]fav:\s*[+-]?\d+[\]］]', '', f_text).strip()
+                        # ★ v2.3.27: 原来只清 [fav:N]，漏了 [FACE:] → 标记泄漏给用户
+                        f_text, _fcq2 = extract_inline_face(f_text)
+                        if f_text:
+                            ctx.append_to_context(chat_id, _ctx_safe(f"{cfg.bot_name}: {f_text}", 200))
+                            await send_by_chat_type(f_text, chat_id if is_group else chat_id,
+                                                   is_group=True if is_group else False,
+                                                   user_id=user_id if not is_group else None)
+                        if _fcq2:
+                            await send_by_chat_type(_fcq2, chat_id if is_group else chat_id,
+                                                   is_group=True if is_group else False,
+                                                   user_id=user_id if not is_group else None)
+                except Exception as e:
+                    import traceback
+                    logger.error("追加回复失败:\n%s", traceback.format_exc())
+        asyncio.create_task(_send_call_results())
+
+    # ------好感度------
+    if fav_change != 0:
+        update_fav(chat_id, user_id, fav_change, is_group)
+        logger.info("好感度调整: %s %+d (chat=%d)", sender_name, fav_change, chat_id)
+
+    # ------自动记忆------
+    buffer_snapshot = list(ctx.get_buffer(chat_id))
+    await maybe_save_memory(msg_content, sentences[0] if sentences else "", sender_name, chat_id, user_id, buffer_snapshot)
+
+    logger.info("✅ 管道处理完成: %d句 sent chat=%d (总耗时%.2fs)",
+                len(sentences), chat_id, _tm.monotonic() - _t_pipe_start)
+
+    # ── 记录画像活跃度（v2.3.34：只计数，不再逐条调 LLM）──
+    #   画像内容由每天 00:05 的批量任务回看整天消息生成（core.user_profile.run_daily）。
+    #   这里保留纯计数的原因：msg_count / last_msg_at 是「是否值得建档」的依据，
+    #   面板也要显示活跃度；而它零成本、不阻塞。
+    try:
+        from core.user_profile import bump_activity
+        bump_activity(chat_id, user_id, is_group)
+    except Exception:
+        pass
+
+    # ── 会话分块压缩（v2.3.10）：块数未超阈值时是空操作，超了才异步压最早的几块 ──
+    #   放后台跑：压缩要调一次便宜模型（秒级），不能拖慢本次回复。
+    asyncio.ensure_future(ctx.maybe_compress(chat_id))
+
+
+# ------指令路由------
+async def _handle_command_route(text, user_id, group_id, sender_name, is_group, bot_qq, raw_message=""):
+    from core.config import get_config
+    cfg = get_config()
+    result = await handle_command(text, user_id, group_id, sender_name, is_group, bot_qq, raw_message=raw_message)
+    if result is None:
+        return
+    if result == "__SYS_TEST_CARD__":
+        await _send_test_card(group_id if is_group else user_id, is_group, user_id)
+        return
+    if isinstance(result, str) and result.startswith("__EQ_CARD__:"):
+        png_path = result.split(":", 1)[1]
+        cq = f"[CQ:image,file=file:///{png_path.replace(chr(92), '/')}]"
+        if is_group:
+            await send_by_chat_type(cq, group_id, is_group=True)
+        else:
+            await send_by_chat_type(cq, group_id, is_group=False, user_id=user_id)
+        return
+    clean_result = re.sub(r'\[(admin|friend|群友)\]', '', result)
+    if is_group:
+        await send_by_chat_type(clean_result, group_id, is_group=True)
+    else:
+        await send_by_chat_type(clean_result, group_id, is_group=False, user_id=user_id)
+
+
+# ------测试卡片------
+async def _send_test_card(chat_id, is_group, user_id):
+    from utils.format_lang import format_lang
+    md = format_lang("testsys.card_markdown")
+    button = {
+        "id": "btn_test",
+        "render_data": {"label": format_lang("testsys.button_label"), "visited_label": format_lang("testsys.button_visited"), "style": 1},
+        "action": {"type": 2, "permission": {"type": 2}, "data": "/~testok", "enter": True, "unsupport_tips": format_lang("testsys.unsupport_tip", default="当前版本不支持此按钮")},
+    }
+    keyboard = {"rows": [{"buttons": [button]}]}
+    card = {"type": "markdown", "data": {"markdown": {"content": md}, "keyboard": keyboard}}
+    logger.info("发送测试卡片: chat=%d is_group=%s", chat_id, is_group)
+    if is_group:
+        await send_raw_group(card, chat_id)
+    else:
+        await send_raw_user(card, user_id)
+
+
+# ------msglog搜索------
+def get_msglog_context(current_msg, context, chat_id):
+    try:
+        if len(current_msg) < 3:
+            return ""
+        query_parts = [current_msg]
+        for line in context[-3:]:
+            content = line.split(": ", 1)[-1] if ": " in line else line
+            if len(content) > 6:
+                query_parts.append(content)
+        query = " ".join(query_parts[-3:])
+        return search_msglog(chat_id, query, limit=6, max_scan=300)
+    except Exception:
+        return ""
+
+
+def _build_at_list(context, cfg, group_id: int = 0):
+    import re
+    seen = {}
+    for line in reversed(context[-30:]):
+        m = re.match(r'\[(admin|friend|群友)\]\s+(.+?):', line)
+        if m:
+            name = m.group(2).strip()
+            # 反查 QQ：先查分群映射，再查全局
+            found_uid = None
+            if group_id:
+                per = cfg.group_nicknames.get(str(group_id), {})
+                for uid, n in per.items():
+                    if n == name and uid not in seen:
+                        found_uid = uid
+                        break
+            if found_uid is None:
+                for uid, n in cfg.qq_name_map.items():
+                    if n == name and uid not in seen:
+                        found_uid = uid
+                        break
+            if found_uid:
+                seen[str(found_uid)] = name
+        if len(seen) >= 8:
+            break
+    if not seen:
+        return ""
+    lines = ["【可 @ 的用户（用 [CQ:at,qq=QQ号] 格式）】"]
+    for uid, name in seen.items():
+        lines.append(f"  {name}: QQ={uid}")
+    return "\n".join(lines)

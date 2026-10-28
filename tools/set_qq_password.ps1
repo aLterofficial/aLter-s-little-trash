@@ -20,12 +20,14 @@
 #>
 param(
     [string]$PasswordFile = 'D:\QQBot\_qqpw.txt',
-    [string]$Account      = '<BOT_QQ>',
+    [string]$Account      = '',
     [string]$Bat          = 'D:\QQBot\NapCat\start-napcat.bat',
     [switch]$Remove
 )
 
 $ErrorActionPreference = 'Stop'
+
+if (-not $Account) { throw 'missing -Account: pass the bot QQ number, e.g. -Account 123456789' }
 
 if (-not (Test-Path $Bat)) { throw "start-napcat.bat not found: $Bat" }
 
@@ -59,8 +61,8 @@ if (-not $Remove) {
 # ---- patch the bat --------------------------------------------------------
 $lines = Get-Content $Bat -Encoding ASCII
 $kept = $lines | Where-Object {
-    $_ -notmatch '^\s*set\s+"?NAPCAT_QUICK_ACCOUNT="<BOT_QQ>"' -and
-    $_ -notmatch '^\s*set\s+"?NAPCAT_QUICK_PASSWORD_MD5="<QQ_PASSWORD_MD5>"
+    $_ -notmatch '^\s*set\s+"?NAPCAT_QUICK_ACCOUNT=' -and
+    $_ -notmatch '^\s*set\s+"?NAPCAT_QUICK_PASSWORD_MD5='
 }
 
 if (-not $Remove) {
@@ -73,8 +75,8 @@ if (-not $Remove) {
     $inject = @(
         '',
         'rem --- unattended login: account + password fallback (MD5 only, no plaintext) ---',
-        ('set "NAPCAT_QUICK_ACCOUNT="<BOT_QQ>"{0}"' -f $Account),
-        ('set "NAPCAT_QUICK_PASSWORD_MD5="<QQ_PASSWORD_MD5>"' -f $md5hex)
+        ('set "NAPCAT_QUICK_ACCOUNT={0}"' -f $Account),
+        ('set "NAPCAT_QUICK_PASSWORD_MD5={0}"' -f $md5hex)
     )
     $out = @()
     $out += $kept[0..$anchor]

@@ -1,4 +1,4 @@
-#Requires -Version 5.1
+﻿#Requires -Version 5.1
 <#
     幻梦 QQ 机器人 —— 一键启动 / 停止 / 状态
     NapCat (QQ 协议) + 幻梦 (Python 框架)

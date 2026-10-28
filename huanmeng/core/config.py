@@ -1,0 +1,549 @@
+"""
+统一配置管理器
+- 一次性加载所有 .toml / .env 配置
+- 提供 BotConfig @dataclass 封装所有运行时参数
+- 支持 reload（重新加载所有配置文件）
+- 所有模块通过 BotConfig 单例访问配置，避免重复读盘
+"""
+
+from __future__ import annotations
+from core.arch_loader import get_architecture_context
+
+import os
+import json
+import toml
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any, Optional
+
+try:
+    from dotenv import load_dotenv
+except ImportError:
+    def load_dotenv(path): pass  # noqa: E701,E301
+
+
+# ── 项目根目录 ──────────────────────────────────────────────
+_PROJECT_ROOT = Path(__file__).resolve().parent.parent
+_CONFIG_DIR = _PROJECT_ROOT / "config"
+_GROUP_NICK_PATH = _PROJECT_ROOT / "data" / "group_nicknames.json"
+
+
+@dataclass
+class ModelConfig:
+    """单个模型配置"""
+    name: str = ""
+    provider: str = ""
+    url: str = ""
+    key: str = ""
+    maxtoken: int = 300
+    switch: bool = False
+
+
+@dataclass
+class BotConfig:
+    """全量配置 — 所有运行时参数集中在此"""
+    
+    # ── 连接信息 ──
+    host: str = "localhost"
+    port: int = 8099
+    
+    # ── 机器人身份 ──
+    bot_name: str = "幻梦"
+    bot_qq: int = 0
+    reply_interest: int = 10         # 回复兴趣阈值
+    context_length: int = 20         # 消息上下文最大条数
+    enable_private: bool = False     # 允许私聊
+    debug_mode: bool = False         # 调试开关
+    version: str = ""                # v2.1.11: 版本号（config/version.toml 优先）
+    
+    # ── 角色权限 ──
+    admin_qq: int = 0
+    friend_qqs: list[int] = field(default_factory=list)
+    qq_name_map: dict[str, str] = field(default_factory=dict)
+    group_nicknames: dict[str, dict[str, str]] = field(default_factory=dict)  # 分群昵称: {群号: {QQ: 昵称}} (来自 nickname_sync)
+    op_qqs: list[int] = field(default_factory=list)           # OP（次级管理员）QQ 列表
+    group_owners: dict[int, list[int]] = field(default_factory=dict) # 群主权限指派: {group_id: [op_qq, ...]}
+    
+    # ── 模型配置 ──
+    reply_model: ModelConfig = field(default_factory=ModelConfig)
+    judge_model: ModelConfig = field(default_factory=ModelConfig)
+    cheap_model: ModelConfig = field(default_factory=ModelConfig)
+    image_model: ModelConfig = field(default_factory=ModelConfig)
+    
+    # ── 人设 ──
+    personality_core: str = ""
+    personality_side: str = ""
+    identity: str = ""
+    system_prompt: str = ""           # 组装后的完整提示词
+
+    # ── 私聊专属人格基底（仅私聊生效，群聊用 personality_*）──
+    private_persona_version: int = 0   # 全局版本号，递增后旧 per-user persona 自动失效
+    private_persona_core: str = ""     # 私聊人格核心（留空回退 personality_core）
+    private_persona_side: str = ""     # 私聊人格侧面（留空回退 personality_side）
+    private_identity: str = ""         # 私聊身份设定（留空回退 identity）
+    
+    # ── 群白名单 ──
+    group_list: list[int] = field(default_factory=list)
+    # ── 私聊白名单 ──
+    private_whitelist: list[int] = field(default_factory=list)
+    # ── 群自定义回复策略 ──
+    # {group_id: {"reply_threshold": 8, "at_only": False}}
+    group_settings: dict[int, dict] = field(default_factory=dict)
+    
+    # ── 文本替换 ──
+    replace_words: list[str] = field(default_factory=list)
+    be_replaced_words: list[str] = field(default_factory=list)
+    
+    # ── 判断关键词 ──
+    search_trigger_words: list[str] = field(default_factory=list)
+    realtime_words: list[str] = field(default_factory=list)
+
+    # ── 反刷屏禁言 ──
+    spam_threshold: int = 8           # 触发禁言的重复@次数
+    mute_duration: int = 1800         # 禁言时长（秒），0=仅警告
+    
+    # ── 构建完整系统提示词 ──
+    def build_system_prompt(self) -> str:
+        self.system_prompt = (
+            f"# 核心人格\n{self.personality_core}\n"
+            f"---\n"
+            f"# 侧面人格\n{self.personality_side}\n"
+            f"---\n"
+            f"# 固定身份\n{self.identity}\n"
+            f"---\n"
+            f"{self._build_self_awareness()}"
+        )
+        return self.system_prompt
+
+    def _build_self_awareness(self) -> str:
+        """构建自我认知：从 data/skills/ 加载 self_awareness 模板并填入动态信息
+
+        v2.2.4：提示词拆到 data/skills/*.md 后，这里扫描 skills 目录找章节；
+        找不到再回退历史遗留的 data/main_skill.md。
+        （config 不能 import services.llm，故就地用正则取段，逻辑与技能文件的
+          ## 章节切分一致：以 ## 开头为界）
+        """
+        import re
+
+        # 读取模板：先扫 skills 目录，再回退遗留单文件
+        _data = Path(__file__).resolve().parent.parent / "data"
+        candidates = sorted((_data / "skills").glob("*.md")) if (_data / "skills").is_dir() else []
+        legacy = _data / "main_skill.md"
+        if legacy.exists():
+            candidates.append(legacy)
+
+        template = ""
+        for f in candidates:
+            try:
+                text = f.read_text(encoding="utf-8")
+            except Exception:
+                continue
+            # 提取 ## self_awareness 段
+            m = re.search(r'## self_awareness\n(.*?)(?=\n## |\Z)', text, re.DOTALL)
+            if m:
+                template = m.group(1).strip()
+                break
+
+        # 版本号：config/version.toml 优先（loaded into self.version），回退 update_log 解析
+        # v2.1.11(2026.9.12): 版本号独立成配置，不再被 update_log 格式变更绑架
+        version = self.version or "v0.0.0"
+        changelog_lines = ""
+        log_path = Path(__file__).resolve().parent.parent / "data" / "update_log.md"
+        if log_path.exists():
+            try:
+                ltext = log_path.read_text(encoding="utf-8")
+                # v2.1.16: 优先按 version.toml 的版本号精确匹配对应条目。
+                # 旧实现只取"文件里第一个 ## vX.Y.Z"——依赖"最新在上"的物理顺序，
+                # 一旦有人把新日志追加到末尾（今天就踩了），bot 自报的「最新更新」
+                # 会停在旧版本上、版本号与内容错位。精确匹配从根上避免这个问题。
+                vm = None
+                if version and version != "v0.0.0":
+                    vm = re.search(rf"## ({re.escape(version)} .+?)(?=\n## |\Z)", ltext, re.DOTALL)
+                    if vm is None:
+                        try:
+                            from core.logger import get_logger as _gl
+                            _gl("config").warning(
+                                "update_log 中找不到版本 %s 的条目，回退取首条（检查是否漏写日志或编号不一致）", version)
+                        except Exception:
+                            pass
+                if vm is None:
+                    vm = re.search(r"## (v[\d.]+ .+?)(?=\n## |\Z)", ltext, re.DOTALL)
+                if vm:
+                    if not version or version == "v0.0.0":
+                        version = vm.group(1).strip().split("\n")[0].strip("#- ")
+                    lines = vm.group(1).strip().split("\n")
+                    lines = [l.strip("- # ").strip() for l in lines if l.strip() and not l.startswith("|") and not l.startswith("###")]
+                    lines = [l for l in lines[:3] if l]  # v2.0.4ac: changelog 6→3 条省 token
+                    changelog_lines = "\n".join(f"- {l}" for l in lines)
+            except Exception:
+                pass
+
+        # 架构（v2.0.4ac 瘦身）：system 常驻只放极简摘要——完整 architecture.mermaid
+        # 曾全量注入(70 行 ≈7.4K 字符)，每条消息都进前缀，miss 时全额计费推高成本，
+        # 而日常聊天/科普根本用不上。完整架构由 pipeline 按关键词(版本/架构/能力/配置等)
+        # 经 core/arch_loader 动态注入 extra_info 末尾（不污染前缀缓存）。
+        arch_lines = (
+            "四层模块化: core(基础设施/上下文/事件/插件/沙箱) → services(llm/发送/图片识别) → "
+            "modules(40+指令/经济/记忆/地震/表情) → utils; 另含 db(SQLite+FTS5检索)、"
+            "plugins(.hmp插件)、data(技能/日志/架构)"
+        )
+
+        model_info = "DeepSeek(回复) + Zhipu(视觉) + DuckDuckGo(搜索)"
+
+        if template:
+            # 使用模板填入变量
+            result = template.replace("${bot_name}", self.bot_name)
+            result = result.replace("${version}", version)
+            result = result.replace("${changelog}", changelog_lines)
+            result = result.replace("${architecture}", arch_lines)
+            result = result.replace("${reply_interest}", str(self.reply_interest))
+            result = result.replace("${context_length}", str(self.context_length))
+            result = result.replace("${model_info}", model_info)
+            result = result.replace("${admin_qq}", str(self.admin_qq))
+            result = result.replace("${host}", self.host)
+            result = result.replace("${port}", str(self.port))
+            return result
+
+        # 回退：硬编码模板（模板文件缺失时）
+        parts = []
+        parts.append(f"# 自我认知\n你是{self.bot_name} {version}。")
+        if changelog_lines:
+            parts.append(f"最新更新：\n{changelog_lines}")
+        if arch_lines:
+            parts.append(f"\n完整架构:\n{arch_lines}")
+        parts.append(f"\n当前设置: 兴趣度阈值={self.reply_interest}, 上下文长度={self.context_length}条")
+        parts.append(f"已接入: {model_info}")
+        parts.append(f"主人 QQ: {self.admin_qq}, 运行: {self.host}:{self.port}")
+        return "\n".join(parts)
+    
+    def get_user_tag(self, user_id: int, group_id: int = 0) -> str:
+        """根据 QQ 号返回角色标签（支持分群 OP 判断）"""
+        if user_id == self.admin_qq:
+            return "admin"
+        # 分群 OP：在指派的群内标签为 op，不混用 admin
+        if group_id and user_id in self.group_owners.get(group_id, []):
+            return "op"
+        if user_id in self.friend_qqs:
+            return "friend"
+        return "群友"
+
+    def is_op(self, user_id: int) -> bool:
+        """是否为 OP（次级管理员）"""
+        return user_id in self.op_qqs
+
+    def is_admin(self, user_id: int, group_id: int = 0) -> bool:
+        """检查用户是否有 admin 权限（主人 + 分群 OP 指派）"""
+        if user_id == self.admin_qq:
+            return True
+        if group_id and user_id in self.group_owners.get(group_id, []):
+            return True
+        return False
+
+    def group_ids(self) -> list[int]:
+        """返回所有已知群号（从群统计归档 + group_owners 中提取）"""
+        from pathlib import Path
+        import re
+        ids = set()
+        _p = Path(__file__).resolve().parent.parent
+        # 统计归档（格式: stats_{group_id}_{date}.json）
+        archive = _p / "data" / "stats_archive"
+        if archive.exists():
+            for f in archive.glob("stats_*.json"):
+                m = re.match(r'stats_(\d+)_', f.name)
+                if m:
+                    ids.add(int(m.group(1)))
+        # 数据目录下的当日文件
+        for f in (_p / "data").glob("group_*_*.json"):
+            try:
+                ids.add(int(f.stem.split("_")[1]))
+            except Exception:
+                pass
+        # group_owners
+        for k in self.group_owners:
+            try:
+                ids.add(int(k))
+            except (ValueError, TypeError):
+                pass
+        return sorted(ids) if ids else []
+
+    def get_group_owner(self, group_id: int) -> list[int]:
+        """获取群的 OP 指派列表"""
+        return self.group_owners.get(group_id, [])
+
+    def get_display_name(self, user_id: int, group_id: int = 0) -> str:
+        """获取用户显示名：分群自动昵称(优先) > 分群手动配置 > 全局昵称 > QQ 号"""
+        uid = str(user_id)
+        # 1. 分群自动昵称（nickname_sync 写入 data/group_nicknames.json）
+        if group_id and self.group_nicknames:
+            per = self.group_nicknames.get(str(group_id))
+            if per and uid in per:
+                return per[uid]
+        # 2. 分群手动配置（adapter_config.toml group_settings.nicknames）
+        if group_id and group_id in self.group_settings:
+            gs_nicks = self.group_settings[group_id].get("nicknames", {})
+            if uid in gs_nicks:
+                return gs_nicks[uid]
+        # 3. fallback 全局昵称
+        return self.qq_name_map.get(uid, uid)
+
+
+# ── 单例实例 ────────────────────────────────────────────────
+_instance: Optional[BotConfig] = None
+
+# bot 名兜底（v2.3.24）：原先 wzq/go_game/chinese_chess 各自复制了一份
+# `get_config().bot_name or "幻梦"`，改配置时容易漏改。统一走这里。
+_BOT_NAME_FALLBACK = "幻梦"
+
+
+def get_bot_name() -> str:
+    """bot 显示名：取配置，取不到用兜底值。
+
+    永不抛异常 —— 在初始化早期或配置损坏时也能安全调用。
+    """
+    try:
+        cfg = get_config()
+        return (getattr(cfg, "bot_name", "") or _BOT_NAME_FALLBACK)
+    except Exception:
+        return _BOT_NAME_FALLBACK
+
+
+def _load_env_config() -> dict[str, dict]:
+    """从 .env 加载 API 密钥和 URL"""
+    env_path = _CONFIG_DIR / ".env"
+    if not env_path.exists():
+        return {}
+    load_dotenv(env_path)
+    
+    providers: dict[str, dict] = {}
+    for key, value in os.environ.items():
+        if key.endswith("_URL"):
+            provider = key[:-4].lower()
+            if provider not in providers:
+                providers[provider] = {}
+            providers[provider]["url"] = value
+        elif key.endswith("_KEY"):
+            provider = key[:-4].lower()
+            if provider not in providers:
+                providers[provider] = {}
+            providers[provider]["key"] = value
+    return providers
+
+
+def _make_model(bot_model_cfg: dict, env_providers: dict[str, dict]) -> ModelConfig:
+    """从 bot_config.toml 中的模型段 + env 配置构建 ModelConfig"""
+    mc = ModelConfig()
+    mc.name = bot_model_cfg.get("name", "")
+    mc.provider = bot_model_cfg.get("provider", "")
+    mc.maxtoken = bot_model_cfg.get("maxtoken", 300)
+    mc.switch = bot_model_cfg.get("开关", False)
+    
+    env_cfg = env_providers.get(mc.provider.lower(), {})
+    mc.url = env_cfg.get("url", "")
+    mc.key = env_cfg.get("key", "")
+    
+    return mc
+
+
+def load_bot_config() -> BotConfig:
+    """
+    加载所有配置文件并构建 BotConfig 实例。
+    这是唯一需要调用的加载函数。
+    """
+    global _instance
+    
+    cfg_path = _CONFIG_DIR / "bot_config.toml"
+    adapter_path = _CONFIG_DIR / "adapter_config.toml"
+    roles_path = _CONFIG_DIR / "roles.toml"
+    
+    # ── bot_config.toml ──
+    if not cfg_path.exists():
+        raise FileNotFoundError(f"主配置文件不存在: {cfg_path}")
+    with open(cfg_path, "r", encoding="utf-8") as f:
+        bot_toml = toml.load(f)
+    
+    bot_section = bot_toml.get("bot", {})
+    judge_section = bot_toml.get("judge", {})
+    personality = bot_toml.get("personality", {})
+    models_section = bot_toml.get("model", {})
+    
+    # ── adapter_config.toml ──
+    adapter = {"host": "localhost", "port": 8099}
+    if adapter_path.exists():
+        with open(adapter_path, "r", encoding="utf-8") as f:
+            adapter_toml = toml.load(f)
+        napcat = adapter_toml.get("napcat_server", {})
+        adapter["host"] = napcat.get("host", adapter["host"])
+        adapter["port"] = napcat.get("port", adapter["port"])
+    
+    # ── roles.toml ──
+    admin_qq = 0
+    friend_qqs: list[int] = []
+    qq_name_map: dict[str, str] = {}
+    group_nicknames: dict[str, dict[str, str]] = {}
+    if roles_path.exists():
+        with open(roles_path, "r", encoding="utf-8") as f:
+            roles_toml = toml.load(f)
+        admin_qq = roles_toml.get("admin_qq", 0)
+        friend_qqs = roles_toml.get("friend_qqs", [])
+        qq_name_map = roles_toml.get("qq_name_map", {})
+        # ★ OP 次级管理员
+        op_qqs_raw = roles_toml.get("op_qqs", [])
+        op_qqs = [int(q) for q in op_qqs_raw]
+        # ★ 群主权限指派: {group_id: [op_qq, ...]}
+        group_owners_raw = roles_toml.get("group_owners", {})
+        group_owners = {}
+        for k, v in group_owners_raw.items():
+            if isinstance(v, list):
+                group_owners[int(k)] = [int(q) for q in v]
+            else:
+                group_owners[int(k)] = [int(v)]  # 兼容旧单个格式
+
+    # ── data/group_nicknames.json 分群昵称（nickname_sync 维护）──
+    if _GROUP_NICK_PATH.exists():
+        try:
+            raw = json.loads(_GROUP_NICK_PATH.read_text(encoding="utf-8"))
+            if isinstance(raw, dict):
+                group_nicknames = {
+                    str(k): {str(q): n for q, n in v.items() if isinstance(v, dict)}
+                    for k, v in raw.items()
+                }
+        except Exception as e:
+            from core.logger import warning
+            warning("加载分群昵称文件失败: %s", e)
+    
+    # ── .env ──
+    env_providers = _load_env_config()
+    
+    # ── 构建 BotConfig ──
+    # ── 私聊白名单 ──
+    private_whitelist_raw = adapter_toml.get("chat", {}).get("private_whitelist", []) if adapter_path.exists() else []
+    private_whitelist = [int(q) for q in private_whitelist_raw]
+
+    # ── 群自定义设置 ──
+    group_settings_raw = adapter_toml.get("group_settings", {}) if adapter_path.exists() else {}
+    group_settings: dict[int, dict] = {}
+    for k, v in group_settings_raw.items():
+        gid = int(k)
+        group_settings[gid] = {
+            "reply_threshold": v.get("reply_threshold", None),
+            "at_only": v.get("at_only", False),
+            # ★ 2026-10-20: 「只看被@的消息」硬开关 —— 未 @ 的消息在 dispatcher 里直接丢弃
+            #   （不读、不记、不判）。注意本字典是**按白名单键重建**的，
+            #   新增 group_settings 键必须在这里登记，否则 TOML 里写了也读不到。
+            "ignore_unmentioned": bool(v.get("ignore_unmentioned", False)),
+            "welcome_msg": v.get("welcome_msg", "").strip() if isinstance(v.get("welcome_msg"), str) else "",
+            "cmd_whitelist": v.get("cmd_whitelist", None),
+            # ★ 分群昵称：{"123456789": "trusler", ...}
+            "nicknames": {str(qq): name for qq, name in v.get("nicknames", {}).items()},
+        }
+
+    instance = BotConfig(
+        host=adapter["host"],
+        port=adapter["port"],
+        bot_name=bot_section.get("bot的名字", "幻梦"),
+        bot_qq=int(bot_section.get("bot的qq号", 0)),
+        reply_interest=bot_section.get("回复兴趣", 10),
+        context_length=bot_section.get("消息记录长度", 20),
+        enable_private=bot_section.get("enable_private_chat", False),
+        debug_mode=bool(bot_section.get("调试模式", False)),
+        admin_qq=admin_qq,
+        friend_qqs=[int(q) for q in friend_qqs],
+        qq_name_map={str(k): v for k, v in qq_name_map.items()},
+        group_nicknames=group_nicknames,
+        op_qqs=op_qqs,
+        group_owners=group_owners,
+        group_list=adapter_toml.get("chat", {}).get("group_list", []) if adapter_path.exists() else [],
+        private_whitelist=private_whitelist,
+        group_settings=group_settings,
+        replace_words=bot_section.get("替换词", []),
+        be_replaced_words=bot_section.get("被替换词", []),
+        search_trigger_words=judge_section.get("search_trigger_words", []),
+        realtime_words=judge_section.get("realtime_words", []),
+        spam_threshold=bot_section.get("spam_threshold", 8),
+        mute_duration=bot_section.get("mute_duration", 1800),
+        personality_core=personality.get("personality_core", ""),
+        personality_side=personality.get("personality_side", ""),
+        identity=personality.get("identity", ""),
+        # ── 私聊专属人格基底 ──
+        private_persona_version=int(bot_toml.get("private_persona", {}).get("version", 0)),
+        private_persona_core=bot_toml.get("private_persona", {}).get("core", ""),
+        private_persona_side=bot_toml.get("private_persona", {}).get("side", ""),
+        private_identity=bot_toml.get("private_persona", {}).get("identity", ""),
+    )
+    # ── 版本号：优先读 config/version.toml，缺省回退 update_log 解析 ──
+    # v2.1.11(2026.9.12): 版本号独立成配置，不再被 update_log 格式变更绑架
+    try:
+        _vpath = _CONFIG_DIR / "version.toml"
+        if _vpath.exists():
+            _vdata = toml.load(_vpath)
+            _cfg_version = str(_vdata.get("version", {}).get("current", "")).strip()
+            if _cfg_version:
+                instance.version = _cfg_version
+    except Exception:
+        pass
+    if not getattr(instance, "version", ""):
+        try:
+            _log_path = _PROJECT_ROOT / "data" / "update_log.md"
+            if _log_path.exists():
+                _lt = _log_path.read_text(encoding="utf-8")
+                _vm = re.search(r"## (v[\d.]+ .+?)(?=\n## |\Z)", _lt, re.DOTALL)
+                if _vm:
+                    instance.version = _vm.group(1).strip().split("\n")[0].strip("#- ")
+        except Exception:
+            pass
+    if not getattr(instance, "version", ""):
+        instance.version = "v0.0.0"
+    
+    # ── 模型配置 ──
+    instance.reply_model = _make_model(models_section.get("replyer_1", {}), env_providers)
+    instance.judge_model = _make_model(models_section.get("utils_small", {}), env_providers)
+    instance.cheap_model = _make_model(models_section.get("judge_cheap", {}), env_providers)
+    instance.image_model = _make_model(models_section.get("picture", {}), env_providers)
+    
+    # 组装提示词
+    instance.build_system_prompt()
+    
+    _instance = instance
+    return instance
+
+
+def get_config() -> BotConfig:
+    """获取当前 BotConfig 实例。未加载时自动加载。"""
+    global _instance
+    if _instance is None:
+        return load_bot_config()
+    return _instance
+
+
+def reload_config() -> BotConfig:
+    """重新加载所有配置文件，返回新实例。"""
+    from core.logger import info, set_debug_mode
+    new_cfg = load_bot_config()
+    set_debug_mode(new_cfg.debug_mode)
+    info("配置已重新加载 | bot=%s | host=%s:%d | debug=%s",
+         new_cfg.bot_name, new_cfg.host, new_cfg.port, new_cfg.debug_mode)
+    return new_cfg
+
+
+def load_roles_config() -> dict:
+    """加载 roles.toml（供指令系统使用）"""
+    roles_path = _CONFIG_DIR / "roles.toml"
+    if not roles_path.exists():
+        return {}
+    with open(roles_path, "r", encoding="utf-8") as f:
+        return toml.load(f)
+
+
+def save_roles_config(config_dict: dict):
+    """保存 roles.toml（供指令系统使用）"""
+    roles_path = _CONFIG_DIR / "roles.toml"
+    content = toml.dumps(config_dict)
+    with open(roles_path, "w", encoding="utf-8") as f:
+        f.write(content)
+
+
+def set_debug_mode(enabled: bool):
+    """动态切换调试模式（外部调用，转发给 logger）"""
+    from core.logger import set_debug_mode as _set_debug_mode
+    _set_debug_mode(enabled)
+
