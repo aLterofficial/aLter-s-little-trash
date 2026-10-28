@@ -1,4 +1,4 @@
-# ── 运行时与数据（绝不入仓）──
+# ── 运行时与数据 ──
 .venv/
 __pycache__/
 *.pyc
@@ -20,7 +20,7 @@ data/faces/*.jpg
 data/faces/*.gif
 data/faces/*.webp
 
-# ── 配置（只保留 example.* 模板）──
+# ── 配置 ──
 huanmeng/config/.env
 huanmeng/config/adapter_config.toml
 huanmeng/config/bot_config.toml
