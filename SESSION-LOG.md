@@ -1,4 +1,4 @@
-# 会话交接日志（SESSION-LOG）
+## 会话交接日志（SESSION-LOG）
 
 ### 包含了一些注意项与内容凭据
 ---
@@ -69,8 +69,8 @@ NapCat 4.18.28  ──注入──▶ QQ NT 9.9.27-45758
   SQLite+FTS5 聊天记录检索
 ```
 
-# 注意 **profile 隔离是硬需求**：QQ 从 Windows 已知文件夹 API 取数据目录（**不是** `%APPDATA%` 环境变量）。
-# 两个 QQ 实例共用同一 profile 会导致"扫码确认后 worker 进程崩溃、会话写不进去"。
+### 注意 **profile 隔离是硬需求**：QQ 从 Windows 已知文件夹 API 取数据目录（**不是** `%APPDATA%` 环境变量）。
+### 两个 QQ 实例共用同一 profile 会导致"扫码确认后 worker 进程崩溃、会话写不进去"。
 
 ---
 
